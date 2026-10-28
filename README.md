@@ -25,7 +25,10 @@ It prints a URL containing a random token (localhost only); open it in Chrome.
 6. **Watch** expressions re-evaluate at every stop.
 7. Uncaught exceptions pause the program (post-mortem) so you can inspect the failing frames.
 8. Breakpoints can be added or removed at any time, also while paused; Continue honors them (other files too).
-9. **Just my code** skips the standard library and site-packages when stepping.
+9. **Hover** (while paused) on a name: signature, docstring, `file:line` (click to open), and for classes/methods the
+   full inheritance chain (**MRO**) with the defining class marked; Ctrl/Cmd+click jumps to the definition.
+   Hover never runs your code (properties and `__getattr__` are not evaluated).
+10. **Just my code** skips the standard library and site-packages when stepping.
 
 **Editing & settings.** The editor is editable (Ctrl+S saves, CRLF preserved, Tab/auto-indent, breakpoints
 follow your edits). The ⚙ Settings menu sets font, theme, accent color and environment variables;

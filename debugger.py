@@ -23,7 +23,9 @@ import collections
 import contextlib
 import enum
 import hmac
+import functools
 import http.server
+import inspect
 import io
 import itertools
 import json
@@ -187,6 +189,144 @@ def _cell(v):
         return _short(str(v), 60)
     except Exception:
         return "?"
+
+
+
+def _def_loc(o):
+    """(file, line) where a class/function/module is defined, or (None, None)."""
+    try:
+        o = inspect.unwrap(o)
+    except Exception:
+        pass
+    try:
+        if isinstance(o, (staticmethod, classmethod)):
+            o = o.__func__
+        elif isinstance(o, property):
+            o = o.fget
+        elif isinstance(o, functools.partial):
+            o = o.func
+        if inspect.ismethod(o):
+            o = o.__func__
+        if inspect.ismodule(o):
+            f = getattr(o, "__file__", None)
+            return (f, 1) if f else (None, None)
+        if inspect.isclass(o):
+            f = inspect.getsourcefile(o)
+            return (f, inspect.findsource(o)[1] + 1) if f else (None, None)
+        if inspect.isfunction(o):
+            fn, line = o.__code__.co_filename, o.__code__.co_firstlineno   # line = first decorator, if any
+            if fn.startswith("<frozen"):          # 3.11+ frozen stdlib: map back to the real source file
+                real = getattr(sys.modules.get(getattr(o, "__module__", None) or ""), "__file__", None)
+                if real:
+                    fn = real
+            try:
+                import linecache
+                src = linecache.getlines(fn)
+                for i in range(line - 1, min(len(src), line + 30)):
+                    if re.match(r"\s*(async\s+def|def)\b", src[i]):
+                        line = i + 1
+                        break
+            except Exception:
+                pass
+            return fn, line
+    except Exception:
+        pass
+    return None, None
+
+
+def _loc_dict(o):
+    f, ln = _def_loc(o)
+    if not f:
+        return None
+    real = os.path.realpath(f)
+    return {"file": real, "line": ln, "exists": os.path.isfile(real)}
+
+
+def _mro_info(cls, mark=None):
+    out = []
+    for c in cls.__mro__:
+        d = {"name": c.__qualname__, "module": c.__module__, "mark": c is mark}
+        d["loc"] = _loc_dict(c)
+        out.append(d)
+    return out
+
+
+def describe(expr, frame):
+    """Hover info for a dotted name, resolved in `frame` WITHOUT running user code
+    (attributes are looked up statically: no properties, no __getattr__)."""
+    names = expr.split(".")
+    if not all(n.isidentifier() for n in names):
+        return None
+    loc, glob = frame.f_locals, frame.f_globals
+    if names[0] in loc:
+        obj = loc[names[0]]
+    elif names[0] in glob:
+        obj = glob[names[0]]
+    elif hasattr(builtins, names[0]):
+        obj = getattr(builtins, names[0])
+    else:
+        return None
+    owner = None
+    for n in names[1:]:
+        owner = obj
+        try:
+            raw = inspect.getattr_static(owner, n)
+        except AttributeError:
+            return None
+        if isinstance(raw, (staticmethod, classmethod)):
+            obj = raw.__func__
+        elif type(raw).__name__ == "member_descriptor":  # __slots__ attribute: reading it is side-effect free
+            try:
+                obj = getattr(owner, n)
+            except AttributeError:
+                obj = raw
+        else:
+            obj = raw
+    name = names[-1]
+    info = {"expr": expr, "name": name}
+    in_module = isinstance(owner, types.ModuleType)
+    if inspect.isclass(obj):
+        kind = "class"
+    elif inspect.ismodule(obj):
+        kind = "module"
+    elif isinstance(obj, property):
+        kind = "property"
+    elif inspect.isfunction(obj) or inspect.isbuiltin(obj) or inspect.ismethoddescriptor(obj) or inspect.ismethod(obj):
+        kind = "method" if (owner is not None and not in_module) else "function"
+    else:
+        kind = "variable"
+    info["kind"] = kind
+    if kind in ("class", "function", "method"):
+        try:
+            info["sig"] = str(inspect.signature(obj))
+        except (TypeError, ValueError):
+            info["sig"] = None
+    if kind in ("class", "function", "method", "module", "property"):
+        info["loc"] = _loc_dict(obj)
+        try:
+            doc = inspect.getdoc(obj)
+        except Exception:
+            doc = None
+        if doc:
+            lines = doc.strip().splitlines()
+            info["doc"] = _short("\n".join(lines[:10]), 700)
+    if kind == "variable":
+        info["type"] = type(obj).__qualname__
+        info["value"] = _summary(obj)
+        info["loc"] = _loc_dict(type(obj))
+    # inheritance: for a class its own MRO; for members the owner's MRO with the defining class marked
+    if kind == "class":
+        info["bases"] = [b.__qualname__ for b in obj.__bases__]
+        info["mro"] = _mro_info(obj)
+    elif owner is not None and not in_module:
+        otype = owner if isinstance(owner, type) else type(owner)
+        definer = next((c for c in otype.__mro__ if name in c.__dict__), None)
+        info["owner"] = otype.__qualname__
+        info["definer"] = definer.__qualname__ if definer else None
+        info["mro"] = _mro_info(otype, definer)
+    elif kind == "variable":
+        info["mro"] = _mro_info(type(obj))
+    return info
 
 
 class Inspector:
@@ -491,6 +631,12 @@ class Dbg(bdb.Bdb):
             out, err = self.console(m["src"], self.stack[self.idx][0])
             self.send({"t": "evalres", "id": m["id"], "out": out, "err": err})
             self.send(dict(t="vars", **self.frame_vars(self.idx)))
+        elif c == "hover":
+            try:
+                info = describe(m["expr"], self.stack[m["frame"]][0])
+            except BaseException:
+                info = None
+            self.send({"t": "hovered", "id": m["id"], "info": info})
         elif c == "expand":
             ch = self.insp.children(m["ref"], m.get("offset", 0))
             self.send({"t": "expanded", "id": m["id"], "children": ch, "error": None if ch is not None else "stale"})
@@ -522,7 +668,7 @@ class Dbg(bdb.Bdb):
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             try:
                 try:
-                    code = compile(src, "<console>", "eval")
+                    code = compile(src, "<console>", "eval", dont_inherit=True)
                 except SyntaxError:
                     code = None
                     s = src.strip()
@@ -530,7 +676,7 @@ class Dbg(bdb.Bdb):
                     for pre, wrap in (("pp ", "__import__('pprint').pprint(%s)"), ("p ", "%s")):
                         if s.startswith(pre):
                             try:
-                                code = compile(wrap % s[len(pre):], "<console>", "eval")
+                                code = compile(wrap % s[len(pre):], "<console>", "eval", dont_inherit=True)
                             except SyntaxError:
                                 pass
                             break
@@ -542,7 +688,7 @@ class Dbg(bdb.Bdb):
                             text = pprint.pformat(v, width=100, compact=True)
                         print(_short(text, 20000))
                 else:
-                    exec(compile(src, "<console>", "exec"), g, l)
+                    exec(compile(src, "<console>", "exec", dont_inherit=True), g, l)
             except BaseException as e:
                 err = True
                 tb = e.__traceback__.tb_next if e.__traceback__ else None
@@ -564,7 +710,7 @@ class Dbg(bdb.Bdb):
         main.__dict__.update(__file__=script, __builtins__=builtins, __doc__=None)
         sys.modules["__main__"] = main
         try:
-            code = compile(source, script, "exec")
+            code = compile(source, script, "exec", dont_inherit=True)   # don't leak this file's __future__ flags into the script
         except SyntaxError:
             traceback.print_exc(limit=0)
             return 1
@@ -965,7 +1111,7 @@ class Session:
             with self.lock:
                 self.vars = {k: m[k] for k in ("frame", "locals", "globals", "watch", "scope")}
             self.emit({"t": "vars", **self.vars})
-        elif t in ("evalres", "expanded", "tabled"):
+        elif t in ("evalres", "expanded", "tabled", "hovered"):
             self.emit(m)
         elif t == "exited":
             pass  # the process-exit path reports it
@@ -990,7 +1136,7 @@ class Session:
                 return
             self.set_state("running", "")
             self.to_worker({"c": name})
-        elif name in ("frame", "eval", "expand", "table"):
+        elif name in ("frame", "eval", "expand", "table", "hover"):
             if self.state == "paused":
                 self.to_worker(dict(body, c=name))
         elif name == "watches":
@@ -1389,6 +1535,16 @@ body[data-state=paused] #status{color:var(--ac)}
 .sw2{width:1.6em;height:1.6em;border:2px solid transparent;border-radius:50%;padding:0;cursor:pointer;outline:1px solid var(--bd)}
 .sw2.on{border-color:var(--tx)}
 .tgl.on{background:var(--ac);border-color:var(--ac-d);color:#fff}
+/* hover tooltip */
+#tip{position:fixed;z-index:20;display:none;max-width:40em;max-height:70vh;overflow:auto;background:var(--pn);border:1px solid var(--tx);border-top:3px solid var(--ac);
+ padding:.4em .7em;box-shadow:0 4px 14px rgba(0,0,0,.3);font-size:.93em;line-height:1.45}
+#tip .h{font-weight:bold}#tip .kind{color:var(--ac-d);font-weight:normal;margin-left:.5em;text-transform:uppercase;font-size:.8em;letter-spacing:.05em}
+#tip .sig{background:var(--cd);padding:.1em .4em;margin:.25em 0;white-space:pre-wrap;word-break:break-word}
+#tip .doc{color:var(--dim);white-space:pre-wrap;margin:.25em 0}
+#tip a{color:var(--ac-d);cursor:pointer;text-decoration:underline dotted}#tip a:hover{background:var(--ac-l)}
+#tip .mro{margin-top:.35em;border-top:1px solid var(--gbd);padding-top:.25em}
+#tip .mro div{padding-left:.2em}#tip .mro .def{font-weight:bold}#tip .mro .def::before{content:'● ';color:var(--ac)}
+#tip .lbl{color:var(--dim);font-size:.82em;text-transform:uppercase;letter-spacing:.05em}
 /* modal */
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:10}
 #modal.on{display:flex}
@@ -1802,6 +1958,17 @@ const MANUAL = `<div class="man">
 <li>Tabs: every file you open or step into gets a tab; <b>×</b> closes it (and re-reads it from disk next time).</li>
 </ul>
 
+<h2>Hover info (while paused)</h2>
+<p>When paused, rest the mouse on a name in the code (about a quarter second) to see what it is, resolved in the live program:</p>
+<ul>
+<li><b>Functions and methods:</b> signature with defaults and annotations, docstring, and where they are defined (<code>file:line</code>, click to open it). For a method called on an object it also says <i>which class in the inheritance chain actually defines it</i>.</li>
+<li><b>Classes:</b> constructor signature, direct bases, docstring and the full <b>MRO</b> (method resolution order). Every class in the MRO is listed with its file and line (clickable); built-ins show "no source".</li>
+<li><b>Variables:</b> type, current value, the file where the type is defined, and the type's MRO. For members like <code>first.greet</code> the defining class is marked with ●.</li>
+<li><b>Go to definition:</b> <kbd>Ctrl</kbd>+click (<kbd>Cmd</kbd> on Mac) a name to jump to where its function, class or type is defined.</li>
+<li>Hover never runs your code: properties and dynamic attributes (<code>__getattr__</code>, DataFrame columns as <code>df.col</code>) show nothing rather than being evaluated. Calls and subscripts (<code>f().x</code>, <code>a[0].x</code>) are not resolved either. Strings and comments are ignored.</li>
+<li>It works for names defined in the frame you are looking at: if you browse a file that is not in the current call stack, there is no hover.</li>
+</ul>
+
 <h2>Call stack (top right)</h2>
 <p>Innermost call on top. <b>Click any frame</b> to jump the editor to that call site and to show that frame's variables; the terminal and watches then run in that frame too. With <i>just my code</i> on, library frames are hidden.</p>
 
@@ -2119,7 +2286,7 @@ function onEvent(m) {
     case 'state':
       if (S.stop && m.state === 'running') { const t = S.stop.stack[S.stop.idx]; S.lastPos = {file: t.file, line: t.line}; }
       if (m.state === 'idle') S.lastPos = S.trail = null;
-      if (m.state !== 'paused') { S.stop = null; renderStack(); marks(); if (m.state === 'idle') { renderVars(null); renderWatchOnly(); } }
+      if (m.state !== 'paused') { hideTip(); S.stop = null; renderStack(); marks(); if (m.state === 'idle') { renderVars(null); renderWatchOnly(); } }
       setState(m.state, m.status); break;
     case 'output': out(m.stream, m.text); break;
     case 'stopped': onStopped(m); break;
@@ -2133,10 +2300,119 @@ function onEvent(m) {
       break;
     }
     case 'tabled': S.pending.delete(m.id); if (S.tbl) renderTable(m.data); break;
+    case 'hovered': {
+      const p = S.pending.get(m.id); S.pending.delete(m.id); if (!p || !m.info) break;
+      if (p.goto) { const l = m.info.loc; if (l && l.exists) jumpTo(l); else toast('No source to jump to'); break; }
+      if (p.key === hoverKey && S.state === 'paused') showTip(m.info, p.px, p.py);
+      break;
+    }
   }
 }
 new EventSource('/events?t=' + encodeURIComponent(TOKEN)).onmessage = e => onEvent(JSON.parse(e.data));
 setState('idle', '');
+
+/* ---------------- hover info (paused only): signature, file, MRO ---------------- */
+const tip = el('div'); tip.id = 'tip'; document.body.appendChild(tip);
+let hoverTimer = 0, hideTimer = 0, hoverKey = '';
+function hideTip() { clearTimeout(hoverTimer); clearTimeout(hideTimer); tip.style.display = 'none'; hoverKey = ''; }   // full reset
+const fadeTip = () => { clearTimeout(hideTimer); hideTimer = setTimeout(() => { tip.style.display = 'none'; }, 160); };   // only hides what is shown, keeps a pending request alive
+const cancelHover = () => { clearTimeout(hoverTimer); hoverKey = ''; };
+tip.addEventListener('mouseenter', () => clearTimeout(hideTimer));
+tip.addEventListener('mouseleave', hideTip);
+function frameForActive() {
+  if (!S.stop) return -1;
+  const st = S.stop.stack;
+  if (st[S.sel] && st[S.sel].file === S.active) return S.sel;
+  for (let i = st.length - 1; i >= 0; i--) if (st[i].file === S.active) return i;
+  return -1;
+}
+function charIndexAt(src, x) {
+  const w = document.createTreeWalker(src, NodeFilter.SHOW_TEXT); let base = 0, n;
+  const r = document.createRange();
+  while ((n = w.nextNode())) {
+    for (let i = 0; i < n.length; i++) {
+      r.setStart(n, i); r.setEnd(n, i + 1);
+      const b = r.getBoundingClientRect();
+      if (b.width && x >= b.left && x < b.right) return base + i;
+    }
+    base += n.length;
+  }
+  return -1;
+}
+function exprAt(line, idx) {
+  if (!/[A-Za-z0-9_]/.test(line[idx] || '')) return null;
+  RX.lastIndex = 0; let m;
+  while ((m = RX.exec(line))) { if ((m[1] || m[2]) && idx >= m.index && idx < m.index + m[0].length) return null; }   // inside a comment or string
+  let s = idx, e = idx + 1;
+  while (s > 0 && /[A-Za-z0-9_]/.test(line[s - 1])) s--;
+  while (e < line.length && /[A-Za-z0-9_]/.test(line[e])) e++;
+  const word = line.slice(s, e);
+  if (/^\d/.test(word) || (KW.has(word) && word !== 'self')) return null;
+  let cs = s;
+  while (cs > 1 && line[cs - 1] === '.' && /[A-Za-z0-9_]/.test(line[cs - 2])) { cs--; while (cs > 0 && /[A-Za-z0-9_]/.test(line[cs - 1])) cs--; }
+  if (cs > 0 && line[cs - 1] === '.') return null;      // base is a call/subscript result, not a plain name
+  const chain = line.slice(cs, e);
+  if (!/^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$/.test(chain)) return null;
+  return {expr: chain, hs: s};
+}
+function tokenUnder(ev) {
+  const row = document.elementsFromPoint(ev.clientX, ev.clientY).find(n => n.classList && n.classList.contains('line'));
+  if (!row) return null;
+  const src = row.lastChild, idx = charIndexAt(src, ev.clientX);
+  if (idx < 0) return null;
+  const x = exprAt(src.textContent, idx);
+  return x && Object.assign(x, {line: +row.dataset.n});
+}
+function requestHover(x, fi, key, px, py, goto) {
+  const id = S.rid++; S.pending.set(id, {type: 'hover', key, px, py, goto});
+  post('hover', {id, expr: x.expr, frame: fi});
+}
+$('#code').addEventListener('mousemove', e => {
+  if (S.state !== 'paused') { if (tip.style.display === 'block') hideTip(); return; }
+  const fi = frameForActive();
+  if (fi < 0 || e.target.closest('.gut')) { cancelHover(); fadeTip(); return; }
+  const x = tokenUnder(e);
+  if (!x) { cancelHover(); fadeTip(); return; }
+  const key = S.active + ':' + x.line + ':' + x.hs + ':' + x.expr + ':' + fi;
+  if (key === hoverKey) { clearTimeout(hideTimer); return; }       // still on the same token
+  clearTimeout(hoverTimer); hoverKey = key;
+  if (tip.style.display === 'block') fadeTip();                     // moving to another token: old tip goes away shortly
+  hoverTimer = setTimeout(() => requestHover(x, fi, key, e.clientX, e.clientY, false), 280);
+});
+$('#code').addEventListener('mouseleave', e => { if (!tip.contains(e.relatedTarget)) { cancelHover(); fadeTip(); } });
+$('#code').addEventListener('scroll', hideTip);
+$('#code').addEventListener('mousedown', e => {       // Ctrl/Cmd+click = go to definition
+  if (!(e.ctrlKey || e.metaKey) || S.state !== 'paused' || e.target.closest('.gut')) return;
+  const fi = frameForActive(), x = fi < 0 ? null : tokenUnder(e);
+  if (!x) return;
+  e.preventDefault(); requestHover(x, fi, '', e.clientX, e.clientY, true);
+}, true);
+function jumpTo(loc) { if (loc && loc.exists) { hideTip(); openFile(loc.file, loc.line); } }
+function locLink(loc, label) {
+  if (!loc) return el('span', 'lbl', 'no source (built-in)');
+  const a = el('a', null, (label || base(loc.file)) + ':' + loc.line); a.title = loc.file; if (loc.exists) a.onclick = () => jumpTo(loc); else a.style.textDecoration = 'none';
+  return a;
+}
+function showTip(i, px, py) {
+  clearTimeout(hideTimer); tip.textContent = '';
+  const h = el('div', 'h', i.name); h.appendChild(el('span', 'kind', i.kind + (i.owner ? ' of ' + i.owner : ''))); tip.appendChild(h);
+  if (i.sig != null) tip.appendChild(el('div', 'sig', (i.kind === 'class' ? 'class ' : 'def ') + i.name + i.sig));
+  if (i.kind === 'variable') tip.appendChild(el('div', 'sig', i.type + ' = ' + i.value));
+  if (i.kind === 'class' && i.bases) tip.appendChild(el('div', null, 'bases: ' + (i.bases.join(', ') || '—')));
+  if (i.definer && i.kind !== 'class') tip.appendChild(el('div', null, 'defined in ' + i.definer));
+  else if (i.owner && i.kind === 'variable') tip.appendChild(el('div', null, 'instance attribute of ' + i.owner));
+  if (i.loc) { const d = el('div'); d.appendChild(el('span', 'lbl', (i.kind === 'variable' ? 'type defined at ' : 'defined at '))); d.appendChild(locLink(i.loc)); tip.appendChild(d); }
+  if (i.doc) tip.appendChild(el('div', 'doc', i.doc));
+  if (i.mro && i.mro.length) {
+    const m = el('div', 'mro'); m.appendChild(el('div', 'lbl', 'MRO (method resolution order)'));
+    i.mro.forEach((c, k) => { const d = el('div', c.mark ? 'def' : ''); d.appendChild(document.createTextNode((k ? '↳ ' : '') + c.name + '  ')); d.appendChild(locLink(c.loc)); m.appendChild(d); });
+    tip.appendChild(m);
+  }
+  tip.style.display = 'block';
+  const w = tip.offsetWidth, hgt = tip.offsetHeight;
+  tip.style.left = Math.max(4, Math.min(px + 8, innerWidth - w - 8)) + 'px';
+  tip.style.top = (py + 18 + hgt > innerHeight ? Math.max(4, py - hgt - 10) : py + 18) + 'px';
+}
 
 /* ---------------- splitters (sizes are remembered) ---------------- */
 document.querySelectorAll('.split').forEach(s => s.addEventListener('mousedown', e => {

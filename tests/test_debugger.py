@@ -470,6 +470,138 @@ class DebuggerTests(unittest.TestCase):
             self.assertIn("BOTH = from_box", out)                 # Env box overrides .env
             self.assertIn("EXPANDED = inherited/x", out)          # $VAR expansion
 
+    def hover(self, q, expr, frame=-1):
+        """Ask the worker for hover info and return it (frame -1 = innermost)."""
+        st = self.h.state()
+        idx = len(st["stop"]["stack"]) - 1 if frame < 0 else frame
+        self.h.sess.command("hover", {"id": expr, "expr": expr, "frame": idx})
+        end = time.time() + 5
+        while time.time() < end:
+            e = q.get(timeout=5)
+            if e.get("t") == "hovered" and e["id"] == expr:
+                return e["info"]
+        raise AssertionError("no hover reply for " + expr)
+
+    def test_hover_signature_file_and_mro(self):
+        f = os.path.join(EX, "demo_mro.py")
+        self.h.run("demo_mro.py", [line_of(f, "total = first.helper")])
+        self.h.paused()
+        q = self.h.sess.add_client()
+        q.get()
+        names = lambda info: [c["name"] for c in info["mro"]]
+        # class: signature, bases, docstring, full MRO with file/line of every user class
+        c = self.hover(q, "Child")
+        self.assertEqual((c["kind"], c["sig"], c["bases"]), ("class", "(value)", ["Mixin", "Base"]))
+        self.assertEqual(names(c), ["Child", "Mixin", "Base", "object"])
+        self.assertEqual(c["doc"], "A child with multiple inheritance.")
+        self.assertEqual((os.path.basename(c["loc"]["file"]), c["loc"]["line"]), ("demo_mro.py", line_of(f, "class Child")))
+        self.assertTrue(c["loc"]["exists"] and c["mro"][1]["loc"]["line"] == line_of(f, "class Mixin"))
+        self.assertIsNone(c["mro"][3]["loc"])                      # object: built-in, no source
+        # method on an instance: signature, and WHICH class in the MRO defines it (Mixin.greet wins over Base.greet)
+        g = self.hover(q, "first.greet")
+        self.assertEqual((g["kind"], g["owner"], g["definer"]), ("method", "Child", "Mixin"))
+        self.assertEqual(g["sig"], "(self, name, punctuation='?')")
+        self.assertEqual(g["loc"]["line"], line_of(f, "def greet", 2))
+        self.assertEqual([c_["name"] for c_ in g["mro"] if c_["mark"]], ["Mixin"])
+        # inherited only from Base
+        self.assertEqual(self.hover(q, "first.helper")["definer"], "Mixin")
+        # annotated function with defaults + docstring
+        b = self.hover(q, "build")
+        self.assertEqual((b["kind"], b["sig"]), ("function", "(count: int, label: str = 'x') -> list"))
+        self.assertEqual(b["doc"], "Build a list of children.")
+        self.assertEqual(b["loc"]["line"], line_of(f, "def build"))
+        # staticmethod via the class
+        m = self.hover(q, "Child.make")
+        self.assertEqual((m["kind"], m["sig"], m["definer"]), ("method", "(v)", "Child"))
+        # variables: type, value, type location + MRO; instance attribute
+        v = self.hover(q, "first")
+        self.assertEqual((v["kind"], v["type"]), ("variable", "Child"))
+        self.assertEqual(names(v), ["Child", "Mixin", "Base", "object"])
+        self.assertEqual(v["loc"]["line"], line_of(f, "class Child"))
+        a = self.hover(q, "first.value")
+        self.assertEqual((a["kind"], a["value"], a["definer"]), ("variable", "0", None))   # instance attribute
+        self.assertIsNone(self.hover(q, "total"))                  # not assigned yet at this line
+        # stdlib / builtin / module
+        j = self.hover(q, "os.path.join")
+        self.assertEqual(j["kind"], "function")
+        self.assertTrue(j["loc"]["file"].endswith("posixpath.py") or j["loc"]["file"].endswith("ntpath.py"))
+        self.assertEqual(self.hover(q, "os")["kind"], "module")
+        ln = self.hover(q, "len")
+        self.assertEqual(ln["kind"], "function")
+        self.assertIsNone(ln["loc"])
+        # not resolvable -> None (never an error)
+        self.assertIsNone(self.hover(q, "nothing_here"))
+        self.assertIsNone(self.hover(q, "first.nothing"))
+        self.assertIsNone(self.hover(q, "1bad.name"))
+        self.h.cmd("continue")
+        self.h.idle()
+
+    def test_hover_never_runs_user_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            main = os.path.join(d, "trap.py")
+            with open(main, "w") as fh:
+                fh.write(textwrap.dedent("""\
+                    calls = []
+
+                    class Trap:
+                        @property
+                        def boom(self):
+                            calls.append("property")
+                            return 1
+
+                        def __getattr__(self, name):
+                            calls.append("getattr:" + name)
+                            return 2
+
+                    t = Trap()
+                    stop_here = 1
+                    print("calls:", calls)
+                    """))
+            self.h.sess.cfg["root"] = d
+            self.h.post("breaks", {"files": {os.path.realpath(main): [14]}})
+            self.h.post("run", {"script": main})
+            self.h.paused()
+            q = self.h.sess.add_client()
+            q.get()
+            p = self.hover(q, "t.boom")
+            self.assertEqual(p["kind"], "property")                # described, not evaluated
+            self.assertEqual(p["loc"]["line"], 5)
+            self.assertIsNone(self.hover(q, "t.dynamic"))          # __getattr__ attribute: not resolvable, not called
+            self.hover(q, "t")
+            self.h.cmd("continue")
+            self.h.idle()
+            self.assertIn("calls: []", self.h.output())            # nothing was executed by hovering
+
+    def test_hover_in_selected_frame(self):
+        f = os.path.join(EX, "demo_mro.py")
+        self.h.run("demo_mro.py", [line_of(f, "child = Child.make(i)")])
+        st = self.h.paused()
+        q = self.h.sess.add_client()
+        q.get()
+        names = [fr["func"] for fr in st["stop"]["stack"]]
+        self.assertEqual(names, ["<module>", "build"])
+        self.assertEqual(self.hover(q, "count", frame=1)["kind"], "variable")      # local of build()
+        self.assertIsNone(self.hover(q, "count", frame=0))                         # not visible in <module>
+        self.assertEqual(self.hover(q, "build", frame=0)["kind"], "function")           # module-level name
+        self.h.post("breaks", {"files": {}})
+        self.h.cmd("continue")
+        self.h.idle()
+
+    def test_script_does_not_inherit_debugger_future_flags(self):
+        with tempfile.TemporaryDirectory() as d:
+            main = os.path.join(d, "ann.py")
+            with open(main, "w") as fh:
+                fh.write("def f(a: int) -> str:\n    return 'x'\nprint('annotations:', f.__annotations__)\nstop = 1\n")
+            self.h.sess.cfg["root"] = d
+            self.h.post("breaks", {"files": {os.path.realpath(main): [4]}})
+            self.h.post("run", {"script": main})
+            self.h.paused()
+            self.h.post("eval", {"id": 1, "src": "def g(b: float): pass\nprint(g.__annotations__)", "frame": 0})
+            time.sleep(0.5)
+            self.h.cmd("continue")
+            self.h.idle()
+            self.assertIn("annotations: {'a': <class 'int'>, 'return': <class 'str'>}", self.h.output())   # real classes, not strings
+
     def test_just_my_code_toggle(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "t.py")
