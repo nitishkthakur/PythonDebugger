@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -28,9 +29,9 @@ def line_of(path, needle, nth=1):
 
 
 class Harness:
-    def __init__(self, root=EX):
+    def __init__(self, root=EX, store=None):
         self.token = "tok"
-        self.sess = debugger.Session(root, "", self.token)
+        self.sess = debugger.Session(root, "", self.token, store)
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), debugger.make_handler(self.sess))
         self.httpd.daemon_threads = True
         self.port = self.httpd.server_address[1]
@@ -249,6 +250,225 @@ class DebuggerTests(unittest.TestCase):
             self.assertEqual(os.path.basename(st["stop"]["stack"][-1]["file"]), "main.py")
             self.h.post("stop")
             self.h.idle()
+
+    def test_breakpoints_added_while_paused_are_honored(self):
+        """Pause at a breakpoint, add more downstream (same file, other file, caller frames,
+        loop body), continue: every new breakpoint must stop the program."""
+        with tempfile.TemporaryDirectory() as d:
+            helper = os.path.join(d, "helper.py")
+            with open(helper, "w") as fh:
+                fh.write("def work(x):\n    y = x * 2\n    z = y + 1\n    return z\n")
+            main = os.path.join(d, "main.py")
+            with open(main, "w") as fh:
+                fh.write(textwrap.dedent("""\
+                    from helper import work
+                    def run():
+                        a = 1
+                        b = work(a)
+                        c = b + 1
+                        return c
+                    result = run()
+                    print("after", result)
+                    for i in range(3):
+                        print(i)
+                    print("end")
+                    """))
+            self.h.sess.cfg["root"] = d
+            hp, mp = os.path.realpath(helper), os.path.realpath(main)
+            # only breakpoint at start: helper.py:2. main.py has none, so its frames start untraced.
+            self.h.post("breaks", {"files": {hp: [2]}})
+            self.h.post("run", {"script": main})
+            st = self.h.paused()
+            self.assertEqual((os.path.basename(st["stop"]["stack"][-1]["file"]), st["stop"]["stack"][-1]["line"]), ("helper.py", 2))
+            # while paused: add breakpoints later in the same function, in the callers, in a loop
+            self.h.post("breaks", {"files": {hp: [2, 3], mp: [5, 8, 10]}})
+            hits = []
+            for _ in range(7):
+                self.h.cmd("continue")
+                st = self.h.wait(lambda s: s["state"] in ("paused", "idle"))
+                if st["state"] == "idle":
+                    break
+                top = st["stop"]["stack"][-1]
+                hits.append((os.path.basename(top["file"]), top["line"]))
+            self.assertEqual(hits, [("helper.py", 3), ("main.py", 5), ("main.py", 8),
+                                    ("main.py", 10), ("main.py", 10), ("main.py", 10)])
+            self.assertIn("exited 0", st["status"])
+            self.assertIn("end", self.h.output())
+
+    def test_deep_multi_file_breakpoints_added_while_paused(self):
+        """main -> pkg/l1 -> pkg/sub/l2 -> pkg/sub/deeper/l3 -> .../l4 (5 files, 4 directories deep).
+        Pause in the deepest file; add breakpoints in every caller file (their frames started untraced)
+        and in a module that has not been imported yet; all must fire, in order."""
+        with tempfile.TemporaryDirectory() as d:
+            def w(rel, body):
+                p = os.path.join(d, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w") as fh:
+                    fh.write(textwrap.dedent(body))
+                return os.path.realpath(p)
+            for pkg in ("pkg", "pkg/sub", "pkg/sub/deeper"):
+                w(pkg + "/__init__.py", "")
+            l4 = w("pkg/sub/deeper/l4.py", """\
+                def f4(x):
+                    v = x + 4
+                    return v
+                """)
+            l3 = w("pkg/sub/deeper/l3.py", """\
+                from pkg.sub.deeper.l4 import f4
+                def f3(x):
+                    r = f4(x)
+                    r += 3
+                    return r
+                """)
+            l2 = w("pkg/sub/l2.py", """\
+                from pkg.sub.deeper.l3 import f3
+                def f2(x):
+                    r = f3(x)
+                    r += 2
+                    return r
+                """)
+            l1 = w("pkg/l1.py", """\
+                from pkg.sub.l2 import f2
+                def f1(x):
+                    r = f2(x)
+                    r += 1
+                    return r
+                """)
+            late = w("pkg/late.py", """\
+                def final(n):
+                    out = n * 10
+                    return out
+                """)
+            main = w("main.py", """\
+                from pkg.l1 import f1
+                value = f1(0)
+                total = value + 100
+                import pkg.late
+                answer = pkg.late.final(total)
+                print("answer", answer)
+                """)
+            self.h.sess.cfg["root"] = d
+            self.h.post("breaks", {"files": {l4: [2]}})           # the only breakpoint at start
+            self.h.post("run", {"script": main})
+            st = self.h.paused()
+            names = [os.path.basename(f["file"]) for f in st["stop"]["stack"]]
+            self.assertEqual(names, ["main.py", "l1.py", "l2.py", "l3.py", "l4.py"])   # 5 files deep
+            # now, while paused: breakpoints in 4 other files (3 directory levels apart) + a not-yet-imported one
+            self.h.post("breaks", {"files": {l4: [2], l3: [4], l2: [4], l1: [4], main: [3], late: [2]}})
+            hits = []
+            for _ in range(8):
+                self.h.cmd("continue")
+                st = self.h.wait(lambda s: s["state"] in ("paused", "idle"))
+                if st["state"] == "idle":
+                    break
+                top = st["stop"]["stack"][-1]
+                hits.append((os.path.basename(top["file"]), top["line"]))
+            self.assertEqual(hits, [("l3.py", 4), ("l2.py", 4), ("l1.py", 4), ("main.py", 3), ("late.py", 2)])
+            self.assertIn("answer 1100", self.h.output())      # f1(0)=10, total=110, final=110*10
+            self.assertIn("exited 0", st["status"])
+
+    def test_remove_and_replace_breakpoints_while_paused(self):
+        with tempfile.TemporaryDirectory() as d:
+            main = os.path.join(d, "m.py")
+            with open(main, "w") as fh:
+                fh.write("a = 1\nb = 2\nc = 3\nd = 4\ne = 5\n")
+            self.h.sess.cfg["root"] = d
+            mp = os.path.realpath(main)
+            self.h.post("breaks", {"files": {mp: [1]}})
+            self.h.post("run", {"script": main})
+            self.h.paused()
+            self.h.post("breaks", {"files": {mp: [3, 5]}})        # replace: 1 stays passed, 3 and 5 new
+            self.h.cmd("continue")
+            self.assertEqual(self.h.wait(lambda s: s["state"] == "paused")["stop"]["stack"][-1]["line"], 3)
+            self.h.post("breaks", {"files": {mp: [5]}})           # remove 3 (already passed), keep 5
+            self.h.cmd("continue")
+            self.assertEqual(self.h.wait(lambda s: s["state"] == "paused")["stop"]["stack"][-1]["line"], 5)
+            self.h.post("breaks", {"files": {}})                  # remove everything and finish
+            self.h.cmd("continue")
+            self.h.idle()
+
+    def test_save_file_preserves_crlf_and_blocks_outside_root(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as other:
+            inside = os.path.join(d, "a.py")
+            with open(inside, "wb") as fh:
+                fh.write(b"x = 1\r\ny = 2\r\n")
+            outside = os.path.join(other, "b.py")
+            with open(outside, "w") as fh:
+                fh.write("z = 1\n")
+            self.h.sess.cfg["root"] = d
+            r = self.h.get("/api/file?path=" + urllib.parse.quote(inside))
+            self.assertTrue(r["crlf"] and not r["readonly"])
+            self.assertEqual(r["text"], "x = 1\ny = 2\n")             # normalized for the editor
+            self.assertEqual(self.h.post("save", {"path": inside, "text": "x = 10\ny = 2\nz = 3\n", "crlf": True}), {"ok": True})
+            with open(inside, "rb") as fh:
+                self.assertEqual(fh.read(), b"x = 10\r\ny = 2\r\nz = 3\r\n")  # CRLF kept
+            ro = self.h.get("/api/file?path=" + urllib.parse.quote(outside))
+            self.assertTrue(ro["readonly"])
+            self.assertIn("error", self.h.post("save", {"path": outside, "text": "hacked\n"}))
+            with open(outside) as fh:
+                self.assertEqual(fh.read(), "z = 1\n")
+            self.assertIn("error", self.h.post("save", {"path": os.path.join(d, "nope.py"), "text": ""}))
+
+    def test_settings_file_roundtrip_and_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "settings.json")
+            store = debugger.SettingsStore(path)
+            self.assertEqual(store.data["prefs"]["font_size"], 14)
+            h = Harness(store=store)
+            try:
+                r = h.post("prefs", {"prefs": {"font_size": 22, "theme": "dark", "accent": "#1f6feb", "line": "relaxed",
+                                               "layout": {"left": 300, "right": 5, "junk": 9}}})
+                self.assertEqual((r["prefs"]["font_size"], r["prefs"]["theme"], r["prefs"]["accent"]), (22, "dark", "#1f6feb"))
+                self.assertEqual(r["prefs"]["layout"], {"left": 300})           # out-of-range / unknown dropped
+                bad = h.post("prefs", {"prefs": {"font_size": 999, "theme": "neon", "accent": "red; x", "font": "comic"}})
+                self.assertEqual((bad["prefs"]["font_size"], bad["prefs"]["theme"], bad["prefs"]["accent"], bad["prefs"]["font"]),
+                                 (32, "dark", "#1f6feb", "default"))             # clamped / rejected, previous kept
+                h.post("config", {"args": "--x 1", "env": "A=1", "dotenv": True, "jmc": False})
+                h.post("breaks", {"files": {os.path.realpath(__file__): [5, 9]}})
+                h.post("watches", {"list": ["a + b"]})
+                self.assertTrue(os.path.exists(path))
+            finally:
+                h.close()
+            # a fresh process (new store + session) reads everything back
+            store2 = debugger.SettingsStore(path)
+            sess2 = debugger.Session(EX, "", "t", store2)
+            self.assertEqual(store2.data["prefs"]["font_size"], 32)
+            self.assertEqual(sess2.cfg["args"], "--x 1")
+            self.assertEqual((sess2.cfg["env"], sess2.cfg["dotenv"], sess2.cfg["jmc"]), ("A=1", True, False))
+            self.assertEqual(sess2.breaks, {os.path.realpath(__file__): {5, 9}})
+            self.assertEqual(sess2.watches, ["a + b"])
+            self.assertEqual(sess2.snapshot()["prefs"]["theme"], "dark")
+            with open(path, "w") as fh:
+                fh.write("{ this is not json")                                  # corrupt file never crashes startup
+            store3 = debugger.SettingsStore(path)
+            self.assertEqual(store3.data["prefs"]["font_size"], 14)
+            self.assertTrue(store3.error)
+            r = h2 = Harness(store=store3)
+            try:
+                self.assertEqual(h2.post("prefs", {"reset": True})["prefs"]["theme"], "light")
+            finally:
+                h2.close()
+
+    def test_environment_variables_reach_the_program(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "show.py"), "w") as fh:
+                fh.write("import os\nfor k in ('FROM_SHELL', 'FROM_ENV_BOX', 'FROM_DOTENV', 'BOTH', 'EXPANDED'):\n    print(k, '=', os.environ.get(k))\n")
+            with open(os.path.join(d, ".env"), "w") as fh:
+                fh.write("# comment\nFROM_DOTENV='dot env'\nBOTH=from_dotenv\nexport QUOTED=\"q\"\n")
+            os.environ["FROM_SHELL"] = "inherited"
+            try:
+                self.h.sess.cfg["root"] = d
+                self.h.post("run", {"script": os.path.join(d, "show.py"), "dotenv": True,
+                                    "env": "FROM_ENV_BOX=box value\nBOTH=from_box\nEXPANDED=$FROM_SHELL/x\n# c"})
+                self.h.idle()
+            finally:
+                del os.environ["FROM_SHELL"]
+            out = self.h.output()
+            self.assertIn("FROM_SHELL = inherited", out)          # inherited from the launching shell
+            self.assertIn("FROM_ENV_BOX = box value", out)
+            self.assertIn("FROM_DOTENV = dot env", out)           # .env loaded
+            self.assertIn("BOTH = from_box", out)                 # Env box overrides .env
+            self.assertIn("EXPANDED = inherited/x", out)          # $VAR expansion
 
     def test_just_my_code_toggle(self):
         with tempfile.TemporaryDirectory() as d:

@@ -218,3 +218,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+debugger_settings.json
+debugger_settings.json.tmp

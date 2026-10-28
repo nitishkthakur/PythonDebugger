@@ -31,8 +31,10 @@ import os
 import pprint
 import queue
 import reprlib
+import re
 import secrets
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -621,18 +623,141 @@ def worker_main(port, script, args):
 # Server side
 # ============================================================================
 
+
+# ---------------------------------------------------------------------------
+# Settings store: a small JSON file next to debugger.py (falls back to $HOME)
+# ---------------------------------------------------------------------------
+
+DEFAULT_PREFS = {"font_size": 14, "font": "default", "line": "normal", "theme": "light",
+                 "accent": "#d71e28", "layout": {}}
+FONT_KEYS = ("default", "courier", "lucida", "system", "sans")
+SESSION_KEYS = ("root", "script", "args", "python", "stop_on_entry", "jmc", "env", "dotenv")
+
+
+def clean_prefs(src, base=None):
+    out = dict(base if base is not None else DEFAULT_PREFS)
+    if not isinstance(src, dict):
+        return out
+    try:
+        out["font_size"] = max(9, min(32, int(src.get("font_size", out["font_size"]))))
+    except (TypeError, ValueError):
+        pass
+    if src.get("font") in FONT_KEYS:
+        out["font"] = src["font"]
+    if src.get("line") in ("compact", "normal", "relaxed"):
+        out["line"] = src["line"]
+    if src.get("theme") in ("light", "dark"):
+        out["theme"] = src["theme"]
+    if isinstance(src.get("accent"), str) and re.fullmatch(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})", src["accent"]):
+        out["accent"] = src["accent"]
+    if isinstance(src.get("layout"), dict):
+        lay = {}
+        for k in ("left", "right", "cons"):
+            try:
+                v = int(src["layout"].get(k))
+                if 60 <= v <= 4000:
+                    lay[k] = v
+            except (TypeError, ValueError):
+                pass
+        out["layout"] = lay
+    return out
+
+
+class SettingsStore:
+    """UI preferences + last session (folder, script, args, breakpoints, watches)."""
+
+    def __init__(self, path=None):
+        self.path = path or self.default_path()
+        self.lock = threading.Lock()
+        self.error = ""
+        self.data = {"version": 1, "prefs": dict(DEFAULT_PREFS), "session": {}, "breakpoints": {}, "watches": []}
+        self.load()
+
+    @staticmethod
+    def default_path():
+        here = os.path.dirname(HERE)
+        if os.access(here, os.W_OK):
+            return os.path.join(here, "debugger_settings.json")
+        return os.path.join(os.path.expanduser("~"), ".debugger_py_settings.json")
+
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            self.error = "ignored unreadable settings file (%s)" % e
+            return
+        if not isinstance(raw, dict):
+            return
+        self.data["prefs"] = clean_prefs(raw.get("prefs"))
+        if isinstance(raw.get("session"), dict):
+            self.data["session"] = {k: v for k, v in raw["session"].items() if k in SESSION_KEYS}
+        if isinstance(raw.get("breakpoints"), dict):
+            self.data["breakpoints"] = {f: [x for x in ls if isinstance(x, int)]
+                                        for f, ls in raw["breakpoints"].items() if isinstance(ls, list)}
+        if isinstance(raw.get("watches"), list):
+            self.data["watches"] = [w for w in raw["watches"] if isinstance(w, str)]
+
+    def save(self):
+        with self.lock:
+            tmp = self.path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(self.data, fh, indent=2, sort_keys=True)
+                os.replace(tmp, self.path)
+                self.error = ""
+            except OSError as e:
+                self.error = "cannot write settings: %s" % e
+
+
+def parse_env(text, expand=False):
+    """KEY=VALUE lines (also `export KEY=VALUE`, quotes, # comments)."""
+    out = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        elif " #" in v:
+            v = v.split(" #", 1)[0].rstrip()
+        if k:
+            out[k] = os.path.expandvars(v) if expand else v
+    return out
+
+
+def _under(path, root):
+    r = os.path.normcase(os.path.realpath(root)).rstrip(os.sep)
+    p = os.path.normcase(os.path.realpath(path))
+    return p == r or p.startswith(r + os.sep)
+
+
 class Session:
     """One debugging session: config, the child process, and event fan-out."""
 
-    def __init__(self, root, script, token):
+    def __init__(self, root, script, token, store=None):
         self.token = token
+        self.store = store
         self.lock = threading.RLock()
         self.cfg = {"root": root, "script": script, "args": "", "python": sys.executable,
-                    "stop_on_entry": False, "jmc": True}
+                    "stop_on_entry": False, "jmc": True, "env": "", "dotenv": False}
+        if store:
+            for k, v in store.data["session"].items():
+                if k not in ("root", "script") and k in self.cfg:
+                    self.cfg[k] = v
         self.state = "idle"
         self.status = ""
         self.breaks = {}
         self.watches = []
+        if store:
+            self.breaks = {f: set(ls) for f, ls in store.data["breakpoints"].items() if os.path.exists(f) and ls}
+            self.watches = list(store.data["watches"])
         self.stop = None
         self.vars = None
         self.output = []
@@ -649,8 +774,32 @@ class Session:
             for q in list(self.clients):
                 q.put(ev)
 
+    def persist(self):
+        if not self.store:
+            return
+        d = self.store.data
+        d["session"] = {k: self.cfg[k] for k in SESSION_KEYS if k in self.cfg}
+        d["breakpoints"] = {f: sorted(ls) for f, ls in self.breaks.items() if ls}
+        d["watches"] = list(self.watches)
+        self.store.save()
+
+    def prefs(self):
+        return self.store.data["prefs"] if self.store else dict(DEFAULT_PREFS)
+
+    def set_prefs(self, body):
+        if not self.store:
+            return self.prefs()
+        reset = bool(body.get("reset"))
+        self.store.data["prefs"] = clean_prefs({} if reset else body.get("prefs"),
+                                               DEFAULT_PREFS if reset else self.store.data["prefs"])
+        self.store.save()
+        return self.store.data["prefs"]
+
     def snapshot(self):
-        return {"t": "snapshot", "cfg": self.cfg, "state": self.state, "status": self.status,
+        return {"t": "snapshot", "prefs": self.prefs(),
+                "settings_path": self.store.path if self.store else "",
+                "settings_error": self.store.error if self.store else "",
+                "cfg": self.cfg, "state": self.state, "status": self.status,
                 "stop": self.stop, "vars": self.vars, "output": self.output,
                 "breaks": {f: sorted(ls) for f, ls in self.breaks.items()}, "watches": self.watches}
 
@@ -689,6 +838,7 @@ class Session:
             for k in self.cfg:
                 if k in new:
                     self.cfg[k] = new[k]
+        self.persist()
         if self.state in ("paused", "running"):
             self.to_worker({"c": "opts", "jmc": bool(self.cfg["jmc"])})
 
@@ -713,7 +863,16 @@ class Session:
         listener.listen(1)
         listener.settimeout(20)
         port = listener.getsockname()[1]
-        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8",
+        env = dict(os.environ)
+        base_dir = cfg["root"] if os.path.isdir(cfg["root"]) else os.path.dirname(script)
+        if cfg.get("dotenv"):
+            try:
+                with open(os.path.join(base_dir, ".env"), "r", encoding="utf-8") as fh:
+                    env.update(parse_env(fh.read()))
+            except OSError:
+                pass
+        env.update(parse_env(cfg.get("env", ""), expand=True))
+        env.update(PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8",
                    DBG_TOKEN=self.token,
                    DBG_OPTS=json.dumps({"jmc": bool(cfg["jmc"]), "stop_on_entry": bool(cfg["stop_on_entry"])}))
         try:
@@ -836,10 +995,12 @@ class Session:
                 self.to_worker(dict(body, c=name))
         elif name == "watches":
             self.watches = list(body.get("list", []))
+            self.persist()
             if self.state == "paused":
                 self.to_worker({"c": "watches", "list": self.watches})
         elif name == "breaks":
             self.breaks = {f: set(ls) for f, ls in body.get("files", {}).items() if ls}
+            self.persist()
             self.to_worker({"c": "breaks", "files": {f: sorted(ls) for f, ls in self.breaks.items()}})
         elif name == "stdin":
             proc = self.proc
@@ -906,7 +1067,7 @@ def _list_dir(path, files):
     return {"path": path, "parent": parent if parent != path else "", "entries": entries}
 
 
-def _read_file(path):
+def _read_file(path, root=""):
     real = os.path.realpath(path)
     try:
         if os.path.getsize(real) > MAX_FILE:
@@ -917,7 +1078,40 @@ def _read_file(path):
         return {"error": str(e), "path": real}
     if b"\0" in data[:4096]:
         return {"error": "binary file", "path": real}
-    return {"path": real, "text": data.decode("utf-8", "replace").replace("\r\n", "\n")}
+    try:
+        text, utf8 = data.decode("utf-8"), True
+    except UnicodeDecodeError:
+        text, utf8 = data.decode("utf-8", "replace"), False
+    crlf = "\r\n" in text
+    readonly = (not utf8) or (not _under(real, root)) or not os.access(real, os.W_OK)
+    return {"path": real, "text": text.replace("\r\n", "\n"), "crlf": crlf, "readonly": readonly}
+
+
+def _save_file(root, body):
+    path = os.path.realpath(body.get("path", ""))
+    if not os.path.isfile(path):
+        return {"error": "file does not exist"}
+    if not _under(path, root):
+        return {"error": "file is outside the project folder (read-only)"}
+    text = body.get("text", "")
+    if body.get("crlf"):
+        text = text.replace("\n", "\r\n")
+    tmp = path + ".dbgtmp"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+        try:
+            shutil.copymode(path, tmp)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return {"error": str(e)}
+    return {"ok": True}
 
 
 def make_handler(sess):
@@ -957,7 +1151,8 @@ def make_handler(sess):
                 self.wfile.write(b"forbidden: open the URL printed by debugger.py (it contains the token)")
                 return
             if u.path == "/":
-                data = PAGE_HTML.encode("utf-8")
+                boot = json.dumps({"prefs": sess.prefs()}).replace("</", "<\\/")
+                data = PAGE_HTML.replace("__BOOT__", boot).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
@@ -968,7 +1163,7 @@ def make_handler(sess):
             elif u.path == "/api/ls":
                 self._json(_list_dir(q.get("path", ""), q.get("files") == "1"))
             elif u.path == "/api/file":
-                self._json(_read_file(q.get("path", "")))
+                self._json(_read_file(q.get("path", ""), sess.cfg["root"]))
             elif u.path == "/api/state":
                 with sess.lock:
                     self._json(sess.snapshot())
@@ -1011,6 +1206,10 @@ def make_handler(sess):
                 sess.start()
             elif name == "stop":
                 sess.stop_proc()
+            elif name == "prefs":
+                return self._json({"prefs": sess.set_prefs(body)})
+            elif name == "save":
+                return self._json(_save_file(sess.cfg["root"], body))
             else:
                 sess.command(name, body)
             self._json({"ok": True})
@@ -1018,9 +1217,9 @@ def make_handler(sess):
     return Handler
 
 
-def serve(root, script, port, open_browser):
+def serve(root, script, port, open_browser, store=None):
     token = secrets.token_urlsafe(16)
-    sess = Session(root, script, token)
+    sess = Session(root, script, token, store)
     handler = make_handler(sess)
     httpd = None
     for p in range(port, port + 50):
@@ -1033,7 +1232,8 @@ def serve(root, script, port, open_browser):
         sys.exit("no free port near %d" % port)
     httpd.daemon_threads = True
     url = "http://127.0.0.1:%d/?t=%s" % (httpd.server_address[1], token)
-    print("debugger.py serving %s\nOpen: %s\n(Ctrl+C to quit)" % (root, url), flush=True)
+    print("debugger.py serving %s\nSettings file: %s\nOpen: %s\n(Ctrl+C to quit)"
+          % (root, store.path if store else "(none)", url), flush=True)
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
@@ -1050,15 +1250,20 @@ def main(argv):
         return worker_main(int(argv[2]), argv[3], argv[4:])
     import argparse
     ap = argparse.ArgumentParser(description="Minimal browser-based Python debugger")
-    ap.add_argument("folder", nargs="?", default=os.getcwd())
+    ap.add_argument("folder", nargs="?", default=None, help="project folder (default: last used, else current directory)")
     ap.add_argument("--script", default="", help="script to run (relative to folder)")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--settings", default=None, help="settings file (default: next to debugger.py)")
     ap.add_argument("--no-browser", action="store_true")
     a = ap.parse_args(argv[1:])
-    root = os.path.realpath(a.folder)
+    store = SettingsStore(a.settings)
+    saved = store.data["session"]
+    folder = a.folder or (saved.get("root") if os.path.isdir(saved.get("root", "")) else None) or os.getcwd()
+    root = os.path.realpath(folder)
     if not os.path.isdir(root):
-        sys.exit("not a folder: %s" % root)
-    serve(root, a.script, a.port, not a.no_browser)
+        sys.exit("not a folder: %s" % folder)
+    script = a.script or (saved.get("script", "") if root == os.path.realpath(saved.get("root", "") or "-") else "")
+    serve(root, script, a.port, not a.no_browser, store)
 
 
 # ============================================================================
@@ -1068,114 +1273,163 @@ def main(argv):
 PAGE_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>debugger.py</title>
 <style>
-:root{--left:230px;--right:340px;--cons:220px;--bg:#ececec;--pn:#fff;--bd:#b4b4b4;--tx:#1c1c1c;--dim:#777;--sel:#d4d4d4;--red:#d71e28;--red-d:#a3141c;--red-m:#f0b3b6;--red-l:#fbe4e5;--red-xl:#fdf3f3;
- --mono:Consolas,Menlo,"DejaVu Sans Mono",monospace}
+:root{--fs:14px;--lh:20px;--left:250px;--right:380px;--cons:210px;
+ --mono:Consolas,Menlo,"DejaVu Sans Mono",monospace;
+ --bg:#ececec;--pn:#fff;--bd:#b4b4b4;--tx:#1c1c1c;--dim:#777;--hd:#dcdcdc;--hv:#f0f0f0;--gut:#f4f4f4;--gbd:#ddd;
+ --btn:#e2e2e2;--btnh:#d0d0d0;--btnbd:#888;--inp:#fff;--sub:#f3f3f3;--spl:#c4c4c4;--cd:#f0f0f0;--sel:#d4d4d4;--off:#aaa;
+ --kw:#000;--st:#666;--cm:#999;--nm:#333;
+ --ac:#d71e28;--ac-d:#a3141c;--ac-m:#f0b3b6;--ac-l:#fbe4e5;--ac-xl:#fdf3f3}
+:root[data-theme=dark]{color-scheme:dark;
+ --bg:#161616;--pn:#202020;--bd:#444;--tx:#e4e4e4;--dim:#9a9a9a;--hd:#2c2c2c;--hv:#2b2b2b;--gut:#262626;--gbd:#363636;
+ --btn:#363636;--btnh:#464646;--btnbd:#666;--inp:#171717;--sub:#292929;--spl:#363636;--cd:#333;--sel:#3a3a3a;--off:#666;
+ --kw:#fff;--st:#b4b4b4;--cm:#7d7d7d;--nm:#cfcfcf}
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:12px/1.4 var(--mono)}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:var(--fs)/1.4 var(--mono)}
 body{display:grid;grid-template-rows:auto auto minmax(0,1fr)}
-input,button,textarea{font:inherit;color:inherit}
-input[type=text]{border:1px solid var(--bd);background:#fff;padding:2px 4px;min-width:0}
-button{border:1px solid #888;background:#e2e2e2;padding:2px 8px;cursor:pointer}
-button:hover:not(:disabled){background:#d0d0d0}
-button:disabled{color:#aaa;border-color:#ccc;cursor:default}
-#brun:not(:disabled){background:var(--red);border-color:var(--red-d);color:#fff}
-#brun:not(:disabled):hover{background:var(--red-d)}
-#bcont:not(:disabled){border-color:var(--red);color:var(--red-d)}
-button.mini{padding:0 4px;font-size:11px;margin-left:6px}
-#cfg{border-top:3px solid #bdbdbd}
-body[data-state=running] #cfg{border-top-color:#555}
-body[data-state=paused] #cfg{border-top-color:var(--red)}
-body[data-state=paused] #status{color:var(--red)}
-#cfg,#ctl{display:flex;gap:8px;align-items:center;padding:4px 6px;border-bottom:1px solid var(--bd);flex-wrap:wrap}
-#cfg label{display:flex;gap:4px;align-items:center;white-space:nowrap}
+input,button,textarea,select{font:inherit;color:inherit}
+input[type=text],input[type=number],select,textarea.fld{border:1px solid var(--bd);background:var(--inp);padding:2px 4px;min-width:0}
+button{border:1px solid var(--btnbd);background:var(--btn);padding:2px .6em;cursor:pointer}
+button:hover:not(:disabled){background:var(--btnh)}
+button:disabled{color:var(--off);border-color:var(--bd);cursor:default;opacity:.7}
+button.mini{padding:0 .35em;font-size:.92em;margin-left:.5em}
+#cfg{border-top:3px solid var(--bd)}
+body[data-state=running] #cfg{border-top-color:var(--dim)}
+body[data-state=paused] #cfg{border-top-color:var(--ac)}
+body[data-state=paused] #status{color:var(--ac)}
+#cfg,#ctl{display:flex;gap:.6em;align-items:center;padding:.3em .5em;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+#cfg label{display:flex;gap:.3em;align-items:center;white-space:nowrap}
+#cfg label.grow{flex:1 1 16em}#cfg label.grow input{flex:1;min-width:0;width:100%}
+#brun:not(:disabled){background:var(--ac);border-color:var(--ac-d);color:#fff}
+#brun:not(:disabled):hover{background:var(--ac-d)}
+#bcont:not(:disabled){border-color:var(--ac);color:var(--ac-d)}
 #status{margin-left:auto;font-weight:bold}
 #main{display:grid;grid-template-columns:var(--left) 4px minmax(0,1fr) 4px var(--right);min-height:0}
 .panel{background:var(--pn);min-height:0;min-width:0;display:flex;flex-direction:column;overflow:hidden}
-.ph{background:#dcdcdc;border-bottom:1px solid var(--bd);padding:2px 6px;font-weight:bold;text-transform:uppercase;font-size:10px;letter-spacing:.06em;flex:none}
+.ph{background:var(--hd);border-bottom:1px solid var(--bd);padding:.1em .5em;font-weight:bold;text-transform:uppercase;font-size:.8em;letter-spacing:.06em;flex:none}
 .pb{overflow:auto;flex:1;min-height:0}
-.split{background:#c4c4c4;cursor:col-resize}.split.h{cursor:row-resize}
-.split:hover{background:var(--red-m)}
+.split{background:var(--spl);cursor:col-resize}.split.h{cursor:row-resize}
+.split:hover{background:var(--ac-m)}
 #center{display:grid;grid-template-rows:auto minmax(0,1fr) 4px var(--cons);min-height:0;min-width:0}
 /* tree */
-.ti{white-space:nowrap;cursor:pointer;padding:0 4px}.ti:hover{background:#eee}
-.ti.dir{font-weight:bold}.ti .tg{display:inline-block;width:12px;color:var(--dim)}
-.ti.run{background:var(--sel)}
+.ti{white-space:nowrap;cursor:pointer;padding:0 .3em;user-select:none}.ti:hover{background:var(--hv)}
+.ti.dir{font-weight:bold}.ti .tg{display:inline-block;width:1em;color:var(--dim)}
+.ti.run{box-shadow:inset 3px 0 var(--ac);background:var(--ac-xl)}
+.ti.run::after{content:' ▶';color:var(--ac);font-size:.8em}
 /* tabs */
-#tabs{display:flex;overflow-x:auto;background:#dcdcdc;border-bottom:1px solid var(--bd)}
-.tab{padding:2px 8px;border-right:1px solid var(--bd);cursor:pointer;white-space:nowrap;color:#444}
-.tab.on{background:#fff;color:#000;font-weight:bold;box-shadow:inset 0 2px var(--red)}
-.tab .x{margin-left:6px;color:var(--dim)}.tab .x:hover{color:#000}
-/* code */
-#code{overflow:auto;background:#fff;min-height:0;position:relative}
-.line{display:flex;width:max-content;min-width:100%;white-space:pre;height:17px;line-height:17px}
-.gut{flex:none;width:58px;display:flex;align-items:center;justify-content:flex-end;gap:4px;padding-right:6px;color:#999;background:#f4f4f4;border-right:1px solid #ddd;cursor:pointer;user-select:none;position:sticky;left:0;z-index:1}
-.gut i{width:10px;height:10px;border-radius:50%;display:inline-block}
-.gut:hover i{background:var(--red-m)}
-.line.bp .gut i{background:var(--red)}
+#tabbar{display:flex;align-items:stretch;background:var(--hd);border-bottom:1px solid var(--bd);min-width:0}
+#tabs{display:flex;overflow-x:auto;flex:1;min-width:0}
+.tab{padding:.15em .6em;border-right:1px solid var(--bd);cursor:pointer;white-space:nowrap;color:var(--dim)}
+.tab.on{background:var(--pn);color:var(--tx);font-weight:bold;box-shadow:inset 0 2px var(--ac)}
+.tab .x{margin-left:.5em;color:var(--dim)}.tab .x:hover{color:var(--tx)}
+.tab .dot{color:var(--ac);margin-right:.2em}
+#edinfo{align-self:center;padding:0 .6em;color:var(--dim);white-space:nowrap}
+#edinfo.mod{color:var(--ac-d);font-weight:bold}
+#toast{align-self:center;padding:0 .6em;color:var(--ac-d);white-space:nowrap}
+#bsave{margin:.15em .4em;align-self:center}
+/* code + editor */
+#code{overflow:auto;background:var(--pn);min-height:0;position:relative}
+.edroot{position:relative;display:inline-block;min-width:100%;vertical-align:top}
+.line{display:flex;width:max-content;min-width:100%;white-space:pre;height:var(--lh);line-height:var(--lh);tab-size:4;-moz-tab-size:4}
+.gut{flex:none;width:5em;display:flex;align-items:center;justify-content:flex-end;gap:.3em;padding-right:.5em;color:var(--dim);background:var(--gut);border-right:1px solid var(--gbd);cursor:pointer;user-select:none;position:sticky;left:0;z-index:2}
+.gut b{font-weight:normal}
+.gut i{width:.8em;height:.8em;border-radius:50%;display:inline-block}
+.gut:hover i{background:var(--ac-m)}
+.line.bp .gut i{background:var(--ac)}
 .src{padding-left:8px}
-.line.caller{background:var(--red-xl)}
-.line.trail{background:var(--red-xl);box-shadow:inset 3px 0 var(--red-m)}
-.line.trail .gut::before{content:'·';color:var(--red);font-weight:bold}
-.line.cur{background:var(--red-l);box-shadow:inset 3px 0 var(--red)}
+.line.caller{background:var(--ac-xl)}
+.line.trail{background:var(--ac-xl);box-shadow:inset 3px 0 var(--ac-m)}
+.line.trail .gut::before{content:'·';color:var(--ac);font-weight:bold}
+.line.cur{background:var(--ac-l);box-shadow:inset 3px 0 var(--ac)}
 .line.cur.flash{animation:flash .9s ease-out}
-@keyframes flash{0%{background:#f6a6aa}100%{background:var(--red-l)}}
-.line.cur .gut{color:var(--red-d);font-weight:bold;background:var(--red-l)}
-.line.cur .gut b::before{content:'▶ ';color:var(--red);font-size:9px}
-.line.exc{background:repeating-linear-gradient(45deg,var(--red-m),var(--red-m) 4px,var(--red-l) 4px,var(--red-l) 8px);box-shadow:inset 4px 0 var(--red-d)}
-.line.exc .gut{color:var(--red-d);font-weight:bold}
-.k{font-weight:bold;color:#000}.s{color:#666}.c{color:#999;font-style:italic}.n{color:#333;text-decoration:underline dotted #999}
-.msg{padding:12px;color:var(--dim)}
+@keyframes flash{0%{background:var(--ac-m)}100%{background:var(--ac-l)}}
+.line.cur .gut{color:var(--ac-d);font-weight:bold;background:var(--ac-l)}
+.line.cur .gut b::before{content:'▶ ';color:var(--ac);font-size:.75em}
+.line.exc{background:repeating-linear-gradient(45deg,var(--ac-m),var(--ac-m) 4px,var(--ac-l) 4px,var(--ac-l) 8px);box-shadow:inset 4px 0 var(--ac-d)}
+.line.exc .gut{color:var(--ac-d);font-weight:bold}
+.k{font-weight:bold;color:var(--kw)}.s{color:var(--st)}.c{color:var(--cm);font-style:italic}.n{color:var(--nm);text-decoration:underline dotted var(--cm)}
+.edta{position:absolute;top:0;bottom:0;left:5em;right:0;margin:0;border:0;outline:0;resize:none;background:transparent;color:transparent;
+ caret-color:var(--tx);font:inherit;line-height:var(--lh);padding:0 0 0 8px;white-space:pre;overflow:hidden;tab-size:4;-moz-tab-size:4}
+.edta::selection{background:rgba(128,128,128,.38);color:transparent}
+.msg{padding:.8em;color:var(--dim)}
 /* console */
-#cons{display:flex;flex-direction:column;background:#fff;border-top:1px solid var(--bd);min-height:0}
-#out{flex:1;overflow:auto;margin:0;padding:4px 6px;white-space:pre-wrap;word-break:break-all;min-height:0}
-#out .err{color:var(--red-d);font-style:italic}#out .sys{color:var(--dim)}#out .in{color:#000;font-weight:bold}#out .bad{color:var(--red-d);background:var(--red-l)}
-#prompt{display:flex;gap:4px;border-top:1px solid var(--bd);padding:2px 6px;align-items:flex-start;background:#f7f7f7;flex:none}
-#in{flex:1;border:0;outline:0;resize:none;background:transparent;font-family:inherit;min-height:17px;max-height:110px;padding:0;overflow:auto}
+#cons{display:flex;flex-direction:column;background:var(--pn);border-top:1px solid var(--bd);min-height:0}
+#out{flex:1;overflow:auto;margin:0;padding:.3em .5em;white-space:pre-wrap;word-break:break-all;min-height:0}
+#out .err{color:var(--ac-d);font-style:italic}#out .sys{color:var(--dim)}#out .in{color:var(--tx);font-weight:bold}#out .bad{color:var(--ac-d);background:var(--ac-l)}
+#prompt{display:flex;gap:.3em;border-top:1px solid var(--bd);padding:.15em .5em;align-items:flex-start;background:var(--gut);flex:none}
+#in{flex:1;border:0;outline:0;resize:none;background:transparent;font-family:inherit;min-height:1.4em;max-height:8em;padding:0;overflow:auto}
 /* variables */
-.vrow{white-space:nowrap;cursor:default;padding:0 4px;display:flex;gap:6px;align-items:baseline}
-.vrow.ex{cursor:pointer}.vrow:hover{background:#f0f0f0}
-.vrow .tg{width:10px;flex:none;color:var(--dim)}
-.vrow .nm{font-weight:bold}.vrow .ty{color:var(--dim);font-size:10px}
+.vrow{white-space:nowrap;cursor:default;padding:0 .3em;display:flex;gap:.5em;align-items:baseline}
+.vrow.ex{cursor:pointer}.vrow:hover{background:var(--hv)}
+.vrow .tg{width:.9em;flex:none;color:var(--dim)}
+.vrow .nm{font-weight:bold}.vrow .ty{color:var(--dim);font-size:.82em}
 .vrow .vl{overflow:hidden;text-overflow:ellipsis;min-width:0}
-.vrow.chg .vl{background:var(--red-l);outline:1px solid var(--red-m);color:var(--red-d)}
-.vrow.er .vl{color:#666;font-style:italic}.vrow.more{color:var(--dim);cursor:pointer}
-.vrow.er .vl{color:var(--red-d)}
-.sub{font-weight:bold;color:#555;padding:2px 4px;background:#f3f3f3;border-top:1px solid #e2e2e2;border-bottom:1px solid #e2e2e2;font-size:10px;text-transform:uppercase}
-.frm{padding:0 6px;white-space:nowrap;cursor:pointer}.frm:hover{background:#eee}.frm.on{background:var(--red-l);font-weight:bold;box-shadow:inset 3px 0 var(--red)}.frm.lib{color:#999}
+.vrow.chg .vl{background:var(--ac-l);outline:1px solid var(--ac-m);color:var(--ac-d)}
+.vrow.er .vl{color:var(--ac-d);font-style:italic}.vrow.more{color:var(--dim);cursor:pointer}
+.sub{font-weight:bold;color:var(--dim);padding:.1em .3em;background:var(--sub);border-top:1px solid var(--gbd);border-bottom:1px solid var(--gbd);font-size:.8em;text-transform:uppercase}
+.frm{padding:0 .5em;white-space:nowrap;cursor:pointer}.frm:hover{background:var(--hv)}
+.frm.on{background:var(--ac-l);font-weight:bold;box-shadow:inset 3px 0 var(--ac)}.frm.lib{color:var(--off)}
 .frm .fl{color:var(--dim)}
 #rt{display:flex;flex-direction:column;min-height:0}
 #rt .panel{flex:none}
-#stackp{max-height:150px}#watchp{max-height:140px}#varp{flex:1 !important}
-#wadd{display:flex;border-top:1px solid #ddd;flex:none}#wadd input{flex:1;border:0;padding:2px 6px;outline:0}
-.wx{color:var(--dim);cursor:pointer;margin-left:auto;padding-left:8px}
-/* manual */
-.man{padding:6px 22px 18px;line-height:1.55;max-width:860px}
-.man h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid var(--red);padding-bottom:2px;margin:18px 0 6px}
-.man h3{font-size:12px;margin:10px 0 2px}
-.man p{margin:3px 0}.man ul{margin:3px 0;padding-left:20px}
-.man kbd{border:1px solid #999;border-bottom-width:2px;background:#f4f4f4;padding:0 4px;font:inherit;white-space:nowrap}
-.man table{border-collapse:collapse;margin:4px 0}.man td,.man th{border:1px solid #ccc;padding:2px 8px;text-align:left;vertical-align:top}
-.man th{background:#eee}.man code{background:#f0f0f0;padding:0 3px}
-.man .sw{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--red);vertical-align:-1px}
-.man .nt{background:var(--red-xl);border-left:3px solid var(--red);padding:3px 8px;margin:6px 0}
+#stackp{max-height:150px}#watchp{max-height:130px}#varp{flex:1 !important}
+#wadd{display:flex;border-top:1px solid var(--gbd);flex:none}#wadd input{flex:1;border:0;padding:.15em .5em;outline:0;background:var(--inp)}
+.wx{color:var(--dim);cursor:pointer;margin-left:auto;padding-left:.5em}
+/* manual & settings */
+.man{padding:.4em 1.6em 1.4em;line-height:1.55;max-width:62em}
+.man h2{font-size:.95em;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid var(--ac);padding-bottom:.1em;margin:1.3em 0 .4em}
+.man p{margin:.25em 0}.man ul{margin:.25em 0;padding-left:1.5em}
+.man kbd{border:1px solid var(--dim);border-bottom-width:2px;background:var(--gut);padding:0 .3em;font:inherit;white-space:nowrap}
+.man table{border-collapse:collapse;margin:.3em 0}.man td,.man th{border:1px solid var(--gbd);padding:.15em .6em;text-align:left;vertical-align:top}
+.man th{background:var(--hd)}.man code{background:var(--cd);padding:0 .25em}
+.man .sw{display:inline-block;width:.85em;height:.85em;border-radius:50%;background:var(--ac);vertical-align:-1px}
+.man .nt{background:var(--ac-xl);border-left:3px solid var(--ac);padding:.2em .6em;margin:.5em 0}
+.srow{display:grid;grid-template-columns:11em 1fr;gap:.6em;align-items:center;padding:.35em 0;border-bottom:1px solid var(--gbd)}
+.srow>label{font-weight:bold}.sctl{display:flex;gap:.4em;align-items:center;flex-wrap:wrap}
+.sctl input[type=number]{width:4.5em}.sctl textarea{width:100%;min-height:6em;font-family:inherit}
+.sw2{width:1.6em;height:1.6em;border:2px solid transparent;border-radius:50%;padding:0;cursor:pointer;outline:1px solid var(--bd)}
+.sw2.on{border-color:var(--tx)}
+.tgl.on{background:var(--ac);border-color:var(--ac-d);color:#fff}
 /* modal */
-#modal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:10}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:10}
 #modal.on{display:flex}
-#mbox{background:#fff;border:2px solid #333;border-top:3px solid var(--red);width:min(92vw,1100px);max-height:86vh;display:flex;flex-direction:column}
-#mbox .ph{display:flex;gap:8px;align-items:center;text-transform:none;font-size:12px}
+#mbox{background:var(--pn);border:2px solid var(--tx);border-top:3px solid var(--ac);width:min(92vw,70em);max-height:88vh;display:flex;flex-direction:column}
+#mbox .ph{display:flex;gap:.6em;align-items:center;text-transform:none;font-size:1em}
 #mbox .ph .sp{flex:1}
-#mbody{overflow:auto;padding:0;min-height:80px}
-table.t{border-collapse:collapse;font-size:12px}
-table.t th,table.t td{border:1px solid #d0d0d0;padding:1px 6px;white-space:nowrap;text-align:right}
-table.t thead th{position:sticky;top:0;background:#e4e4e4;z-index:1}
-table.t th.i{position:sticky;left:0;background:#eee;text-align:left}
-table.t .dt{font-weight:normal;color:var(--dim);font-size:10px;display:block}
-</style></head><body>
+#mbody{overflow:auto;padding:0;min-height:5em}
+table.t{border-collapse:collapse}
+table.t th,table.t td{border:1px solid var(--gbd);padding:.05em .5em;white-space:nowrap;text-align:right}
+table.t thead th{position:sticky;top:0;background:var(--hd);z-index:1}
+table.t th.i{position:sticky;left:0;background:var(--sub);text-align:left}
+table.t .dt{font-weight:normal;color:var(--dim);font-size:.82em;display:block}
+</style>
+<script>
+const BOOT = __BOOT__;
+const FONTS = {default: 'Consolas,Menlo,"DejaVu Sans Mono",monospace', courier: '"Courier New",Courier,monospace',
+  lucida: '"Lucida Console",Monaco,monospace', system: 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+  sans: 'system-ui,"Segoe UI",Arial,sans-serif'};
+const hex2rgb = h => { h = h.replace('#', ''); if (h.length === 3) h = h.split('').map(c => c + c).join(''); const n = parseInt(h, 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
+const mix = (a, b, t) => '#' + a.map((v, i) => Math.round(v * (1 - t) + b[i] * t).toString(16).padStart(2, '0')).join('');
+function applyPrefs(p) {
+  const root = document.documentElement, r = root.style, dark = p.theme === 'dark';
+  r.setProperty('--fs', p.font_size + 'px');
+  r.setProperty('--mono', FONTS[p.font] || FONTS.default);
+  r.setProperty('--lh', Math.round(p.font_size * ({compact: 1.3, normal: 1.45, relaxed: 1.7}[p.line] || 1.45)) + 'px');
+  root.dataset.theme = dark ? 'dark' : 'light';
+  const a = hex2rgb(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(p.accent) ? p.accent : '#d71e28'), W = [255, 255, 255], bg = dark ? [32, 32, 32] : W;
+  r.setProperty('--ac', mix(a, a, 0));
+  r.setProperty('--ac-d', dark ? mix(a, W, .4) : mix(a, [0, 0, 0], .3));
+  r.setProperty('--ac-m', dark ? mix(a, bg, .5) : mix(a, W, .7));
+  r.setProperty('--ac-l', dark ? mix(a, bg, .75) : mix(a, W, .88));
+  r.setProperty('--ac-xl', dark ? mix(a, bg, .88) : mix(a, W, .95));
+  for (const k of ['left', 'right', 'cons']) { if (p.layout && p.layout[k]) r.setProperty('--' + k, p.layout[k] + 'px'); else r.removeProperty('--' + k); }
+}
+applyPrefs(BOOT.prefs);   // before first paint
+</script></head><body>
 <div id="cfg">
-  <label>Folder <input type="text" id="root" size="34"></label><button id="bopen">Open</button><button id="bbrowse">Browse…</button>
-  <label>Script <input type="text" id="script" size="26"></label>
-  <label>Args <input type="text" id="args" size="16"></label>
-  <label>Python <input type="text" id="python" size="22"></label>
+  <label class="grow">Folder <input type="text" id="root" size="20"></label><button id="bopen">Open</button><button id="bbrowse">Browse…</button>
+  <label>Script <input type="text" id="script" size="22"></label>
+  <label>Args <input type="text" id="args" size="14"></label>
+  <label>Python <input type="text" id="python" size="20"></label>
   <label><input type="checkbox" id="soe">stop on entry</label>
   <label><input type="checkbox" id="jmc" checked>just my code</label>
 </div>
@@ -1183,13 +1437,13 @@ table.t .dt{font-weight:normal;color:var(--dim);font-size:10px;display:block}
   <button id="brun">Run</button><button id="bcont" title="F8">Continue</button><button id="bnext" title="F10">Step Over</button>
   <button id="bstep" title="F11">Step Into</button><button id="bout" title="Shift+F11">Step Out</button>
   <button id="bstop">Stop</button><button id="brestart">Restart</button>
-  <span id="status">idle</span><button id="bhelp" title="F1">? Help</button>
+  <span id="status">idle</span><button id="bfm" title="Smaller text only (Ctrl and minus)">A−</button><button id="bfp" title="Larger text only (Ctrl and plus)">A+</button><button id="bset" title="Font size, theme, environment">⚙ Settings</button><button id="bhelp" title="F1">? Help</button>
 </div>
 <div id="main">
-  <div class="panel"><div class="ph">Files</div><div class="pb" id="tree"></div></div>
+  <div class="panel" id="files"><div class="ph">Files</div><div class="pb" id="tree"></div></div>
   <div class="split" data-v="--left" data-d="1"></div>
   <div id="center">
-    <div id="tabs"></div>
+    <div id="tabbar"><div id="tabs"></div><span id="toast"></span><span id="edinfo"></span><button id="bsave" title="Ctrl+S">Save</button></div>
     <div id="code"><div class="msg">Open a folder, click a .py file, set breakpoints in the gutter, press Run.</div></div>
     <div class="split h" data-v="--cons" data-d="-1"></div>
     <div id="cons"><div class="ph">Console / terminal <span style="font-weight:normal;text-transform:none"> — when paused, type Python to run in the selected frame (e.g. <b>flag = True</b>); while running, input goes to the script's stdin</span></div>
@@ -1220,11 +1474,11 @@ async function get(name, params) {
   const u = new URLSearchParams(params || {}); u.set('t', TOKEN);
   return (await fetch('/api/' + name + '?' + u)).json();
 }
-const S = {cfg: {}, state: 'idle', status: '', files: new Map(), alias: new Map(), tabs: [], active: null, breaks: new Map(),
-  stop: null, sel: 0, expanded: new Set(), prevVals: new Map(), curVals: new Map(), pending: new Map(), rid: 1,
-  hist: [], hpos: 0, watches: [], lastVars: null, tbl: null};
+const S = {cfg: {}, prefs: BOOT.prefs, settingsPath: '', state: 'idle', status: '', files: new Map(), alias: new Map(), tabs: [], active: null,
+  breaks: new Map(), stop: null, sel: 0, expanded: new Set(), prevVals: new Map(), curVals: new Map(), pending: new Map(), rid: 1,
+  hist: [], hpos: 0, watches: [], lastVars: null, tbl: null, lastPos: null, trail: null, raf: 0};
 
-/* ---------------- syntax highlighting (grayscale classes) ---------------- */
+/* ---------------- syntax highlighting ---------------- */
 const KW = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield self'.split(' '));
 const RX = /(#[^\n]*)|("{3}[\s\S]*?"{3}|'{3}[\s\S]*?'{3}|(?:[rRbBuUfF]{0,2})"(?:\\.|[^"\\\n])*"|(?:[rRbBuUfF]{0,2})'(?:\\.|[^'\\\n])*')|(\b\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?\b)|(\b[A-Za-z_]\w*\b)/g;
 function highlight(text) {
@@ -1244,9 +1498,9 @@ function highlight(text) {
   lines.push(cur);
   return lines;
 }
-const codeLike = l => { const t = l.trim(); return t && !t.startsWith('#'); };
+const codeLike = l => { const t = (l || '').trim(); return t && !t.startsWith('#'); };
 
-/* ---------------- files & tabs ---------------- */
+/* ---------------- files, tabs, editor ---------------- */
 async function loadFile(path) {
   path = S.alias.get(path) || path;
   if (S.files.has(path)) return S.files.get(path);
@@ -1255,20 +1509,26 @@ async function loadFile(path) {
   S.alias.set(path, key);
   let f = S.files.get(key);
   if (!f) {
-    f = r.error ? {path: key, error: r.error} : {path: key, html: highlight(r.text), raw: r.text.split('\n')};
+    f = r.error ? {path: key, error: r.error}
+      : {path: key, text: r.text, saved: r.text, crlf: !!r.crlf, readonly: !!r.readonly, dirty: false, lines: r.text.split('\n'), html: highlight(r.text), scroll: [0, 0]};
     S.files.set(key, f);
   }
   return f;
 }
+function rememberScroll() { const f = S.files.get(S.active); if (f && !f.error) { const c = $('#code'); f.scroll = [c.scrollTop, c.scrollLeft]; } }
 async function openFile(path, line) {
   const f = await loadFile(path);
+  rememberScroll();
   if (!S.tabs.includes(f.path)) S.tabs.push(f.path);
   S.active = f.path;
-  renderTabs(); renderCode(); if (line) scrollTo(line);
+  renderTabs(); renderCode();
+  if (line) scrollTo(line); else if (f.scroll) { $('#code').scrollTop = f.scroll[0]; $('#code').scrollLeft = f.scroll[1]; }
   return f;
 }
 function closeTab(p) {
   const i = S.tabs.indexOf(p); if (i < 0) return;
+  const f = S.files.get(p);
+  if (f && f.dirty && !confirm('Discard unsaved changes to ' + base(p) + '?')) return;
   S.tabs.splice(i, 1); S.files.delete(p);  // reopening re-reads the file from disk
   if (S.active === p) S.active = S.tabs[Math.min(i, S.tabs.length - 1)] || null;
   renderTabs(); renderCode();
@@ -1277,28 +1537,118 @@ const base = p => p.split(/[\\/]/).pop();
 function renderTabs() {
   const t = $('#tabs'); t.textContent = '';
   for (const p of S.tabs) {
-    const d = el('div', 'tab' + (p === S.active ? ' on' : ''), base(p)); d.title = p;
-    d.onclick = () => { S.active = p; renderTabs(); renderCode(); };
+    const f = S.files.get(p);
+    const d = el('div', 'tab' + (p === S.active ? ' on' : '')); d.title = p;
+    if (f && f.dirty) d.appendChild(el('span', 'dot', '●'));
+    d.appendChild(document.createTextNode(base(p)));
+    d.onclick = () => { rememberScroll(); S.active = p; renderTabs(); renderCode(); const g = S.files.get(p); if (g && g.scroll) { $('#code').scrollTop = g.scroll[0]; $('#code').scrollLeft = g.scroll[1]; } };
     const x = el('span', 'x', '×'); x.onclick = e => { e.stopPropagation(); closeTab(p); }; d.appendChild(x);
     t.appendChild(d);
+    if (p === S.active) requestAnimationFrame(() => d.scrollIntoView({block: 'nearest', inline: 'nearest'}));
   }
+}
+function updateEdInfo() {
+  const f = S.files.get(S.active), i = $('#edinfo'), b = $('#bsave');
+  i.className = ''; i.textContent = '';
+  if (f && !f.error) {
+    if (f.readonly) i.textContent = 'read-only';
+    else if (f.dirty) { i.textContent = 'modified'; i.className = 'mod'; }
+  }
+  b.disabled = !(f && !f.error && f.dirty && !f.readonly);
+}
+let toastTimer = 0;
+function toast(t) { const e = $('#toast'); e.textContent = t; clearTimeout(toastTimer); toastTimer = setTimeout(() => e.textContent = '', 5000); }
+function makeRow(n, h) {
+  const row = el('div', 'line'); row.id = 'L' + n; row.dataset.n = n;
+  const g = el('span', 'gut'); g.appendChild(el('i')); g.appendChild(el('b', null, String(n)));
+  g.onclick = () => toggleBp(n);
+  const s = el('span', 'src'); s.innerHTML = h || ' '; s._h = h;
+  row.appendChild(g); row.appendChild(s); return row;
 }
 function renderCode() {
   const c = $('#code'); c.textContent = '';
   const f = S.files.get(S.active);
-  if (!f) { c.appendChild(el('div', 'msg', 'Open a folder, click a .py file, set breakpoints in the gutter, press Run.')); return; }
-  if (f.error) { c.appendChild(el('div', 'msg', f.path + ': ' + f.error)); return; }
+  if (!f) { c.appendChild(el('div', 'msg', 'Open a folder, click a .py file, set breakpoints in the gutter, press Run.')); updateEdInfo(); return; }
+  if (f.error) { c.appendChild(el('div', 'msg', f.path + ': ' + f.error)); updateEdInfo(); return; }
+  const root = el('div', 'edroot'); root.id = 'edroot';
   const frag = document.createDocumentFragment();
-  f.html.forEach((h, i) => {
-    const n = i + 1, row = el('div', 'line'); row.id = 'L' + n; row.dataset.n = n;
-    const g = el('span', 'gut'); g.appendChild(el('i')); g.appendChild(el('b', null, String(n)));
-    g.onclick = () => toggleBp(f.path, n, f);
-    const s = el('span', 'src'); s.innerHTML = h || ' ';
-    row.appendChild(g); row.appendChild(s); frag.appendChild(row);
-  });
-  c.appendChild(frag);
-  marks();
+  f.html.forEach((h, i) => frag.appendChild(makeRow(i + 1, h)));
+  root.appendChild(frag);
+  const ta = el('textarea', 'edta'); ta.id = 'edta'; ta.value = f.text; ta.spellcheck = false; ta.wrap = 'off'; ta.readOnly = f.readonly;
+  ta.setAttribute('autocapitalize', 'off'); ta.setAttribute('autocomplete', 'off');
+  ta.addEventListener('input', onEdInput); ta.addEventListener('keydown', onEdKey);
+  ta.addEventListener('keyup', ev => { if (ev.key.startsWith('Arrow') || ev.key === 'Home' || ev.key === 'End' || ev.key.startsWith('Page')) ensureCaret(ta); });
+  root.appendChild(ta); c.appendChild(root);
+  marks(); updateEdInfo();
 }
+function syncRows(f) {
+  const root = $('#edroot'); if (!root) return;
+  const rows = root.querySelectorAll('.line'), n = f.html.length;
+  for (let i = 0; i < Math.min(rows.length, n); i++) {
+    const s = rows[i].lastChild;
+    if (s._h !== f.html[i]) { s.innerHTML = f.html[i] || ' '; s._h = f.html[i]; }
+  }
+  for (let i = rows.length - 1; i >= n; i--) rows[i].remove();
+  const ta = $('#edta');
+  for (let i = rows.length; i < n; i++) root.insertBefore(makeRow(i + 1, f.html[i]), ta);
+  if (rows.length !== n) marks();
+}
+function onEdInput(e) {
+  const f = S.files.get(S.active); if (!f) return;
+  const was = f.dirty;
+  f.text = e.target.value; f.lines = f.text.split('\n'); f.dirty = f.text !== f.saved;
+  if (!S.raf) S.raf = requestAnimationFrame(() => { S.raf = 0; const g = S.files.get(S.active); if (g && !g.error) { g.html = highlight(g.text); syncRows(g); } });
+  if (was !== f.dirty) renderTabs();
+  updateEdInfo(); ensureCaret(e.target);
+}
+let charW = 0, charFont = '';
+function ensureCaret(ta) {
+  const c = $('#code'), cs = getComputedStyle(ta), lh = parseFloat(cs.lineHeight) || 20, v = ta.value, p = ta.selectionStart;
+  let line = 0; for (let i = v.indexOf('\n'); i >= 0 && i < p; i = v.indexOf('\n', i + 1)) line++;
+  const top = line * lh, bot = top + lh;
+  if (top < c.scrollTop) c.scrollTop = top; else if (bot > c.scrollTop + c.clientHeight - 6) c.scrollTop = bot - c.clientHeight + 6;
+  if (cs.font !== charFont) { const cv = document.createElement('canvas').getContext('2d'); cv.font = cs.font; charW = cv.measureText('M').width; charFont = cs.font; }
+  const col = p - v.lastIndexOf('\n', p - 1) - 1, x = col * charW + parseFloat(cs.paddingLeft) + ta.offsetLeft;
+  if (x < c.scrollLeft + ta.offsetLeft + 10) c.scrollLeft = Math.max(0, x - ta.offsetLeft - 10);
+  else if (x > c.scrollLeft + c.clientWidth - 30) c.scrollLeft = x - c.clientWidth + 60;
+}
+function onEdKey(e) {
+  const ta = e.target;
+  if (ta.readOnly) return;
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const v = ta.value, s = ta.selectionStart, en = ta.selectionEnd;
+    if (s === en && !e.shiftKey) { document.execCommand('insertText', false, '    '); return; }
+    const ls = v.lastIndexOf('\n', s - 1) + 1;
+    let le = v.indexOf('\n', en > s && v[en - 1] === '\n' ? en - 1 : en); if (le < 0) le = v.length;
+    const out = v.slice(ls, le).split('\n').map(l => e.shiftKey ? l.replace(/^( {1,4}|\t)/, '') : '    ' + l).join('\n');
+    ta.setSelectionRange(ls, le); document.execCommand('insertText', false, out); ta.setSelectionRange(ls, ls + out.length);
+  } else if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    const v = ta.value, s = ta.selectionStart, ls = v.lastIndexOf('\n', s - 1) + 1, line = v.slice(ls, s);
+    let ind = line.match(/^[ \t]*/)[0]; if (/:\s*(#.*)?$/.test(line)) ind += '    ';
+    document.execCommand('insertText', false, '\n' + ind);
+  }
+}
+function shiftBreaks(path, oldT, newT) {
+  const s = S.breaks.get(path); if (!s || !s.size) return false;
+  const a = oldT.split('\n'), b = newT.split('\n'); let p = 0;
+  while (p < a.length && p < b.length && a[p] === b[p]) p++;
+  let q = 0; while (q < a.length - p && q < b.length - p && a[a.length - 1 - q] === b[b.length - 1 - q]) q++;
+  const delta = b.length - a.length, out = new Set();
+  s.forEach(n => { if (n <= p) out.add(n); else if (n > a.length - q) out.add(n + delta); });
+  const changed = out.size !== s.size || [...s].some(n => !out.has(n));
+  S.breaks.set(path, out); return changed;
+}
+async function saveFile(f) {
+  if (!f || f.error || f.readonly || !f.dirty) return;
+  const r = await post('save', {path: f.path, text: f.text, crlf: f.crlf});
+  if (r.error) { toast('Save failed: ' + r.error); return; }
+  if (shiftBreaks(f.path, f.saved, f.text)) syncBreaks();
+  f.saved = f.text; f.dirty = false; renderTabs(); updateEdInfo(); marks();
+  toast(S.state === 'idle' ? 'Saved' : 'Saved — Restart to run the new code');
+}
+$('#bsave').onclick = () => saveFile(S.files.get(S.active));
 function marks(flash) {
   const c = $('#code');
   c.querySelectorAll('.cur,.caller,.exc,.bp,.trail,.flash').forEach(e => e.classList.remove('cur', 'caller', 'exc', 'bp', 'trail', 'flash'));
@@ -1317,19 +1667,21 @@ function scrollTo(line) {
   if (er.top < cr.top + 20 || er.bottom > cr.bottom - 20) c.scrollTop += (er.top - cr.top) - cr.height / 2;
   c.scrollLeft = 0;
 }
-function toggleBp(path, n, f) {
-  if (!codeLike(f.raw[n - 1] || '')) return;
-  let s = S.breaks.get(path); if (!s) S.breaks.set(path, s = new Set());
+function toggleBp(n) {
+  const f = S.files.get(S.active); if (!f || f.error) return;
+  if (!codeLike(f.lines[n - 1])) return;
+  let s = S.breaks.get(f.path); if (!s) S.breaks.set(f.path, s = new Set());
   s.has(n) ? s.delete(n) : s.add(n);
-  marks(); syncBreaks();
+  marks(); syncBreaks();   // takes effect immediately, even while paused or running
 }
+let breakSync = Promise.resolve();
 function syncBreaks() {
   const files = {}; S.breaks.forEach((s, p) => { if (s.size) files[p] = [...s].sort((a, b) => a - b); });
-  post('breaks', {files});
+  breakSync = breakSync.then(() => post('breaks', {files})).catch(() => {});   // delivered in order
 }
 
 /* ---------------- file tree & folder browser ---------------- */
-function treeNode(entry, depth, onFile, container) {
+function treeNode(entry, depth, onFile, container, onDbl) {
   const wrap = el('div'), row = el('div', 'ti' + (entry.dir ? ' dir' : ''));
   row.style.paddingLeft = (depth * 12 + 4) + 'px';
   const tg = el('span', 'tg', entry.dir ? '▸' : ''); row.appendChild(tg); row.appendChild(document.createTextNode(entry.name));
@@ -1339,8 +1691,9 @@ function treeNode(entry, depth, onFile, container) {
   row.onclick = async () => {
     if (!entry.dir) { onFile(entry, row); return; }
     open = !open; tg.textContent = open ? '▾' : '▸'; kids.textContent = '';
-    if (open) { const r = await get('ls', {path: entry.path, files: 1}); (r.entries || []).forEach(e => kids.appendChild(treeNode(e, depth + 1, onFile))); }
+    if (open) { const r = await get('ls', {path: entry.path, files: 1}); (r.entries || []).forEach(e => kids.appendChild(treeNode(e, depth + 1, onFile, null, onDbl))); markScriptRow(); }
   };
+  if (!entry.dir && onDbl) row.ondblclick = () => onDbl(entry, row);
   container && container.appendChild(wrap);
   return wrap;
 }
@@ -1348,23 +1701,24 @@ async function loadTree() {
   const t = $('#tree'); t.textContent = '';
   const r = await get('ls', {path: S.cfg.root, files: 1});
   if (r.error) { t.appendChild(el('div', 'msg', r.error)); return; }
-  (r.entries || []).forEach(e => t.appendChild(treeNode(e, 0, async (en, row) => {
-    await openFile(en.path);
-    if (/\.py$/i.test(en.path)) { setScript(en.path); }
-  })));
+  const onFile = async en => { await openFile(en.path); if (!S.cfg.script && /\.py$/i.test(en.path)) setScript(en.path); };   // first file opened becomes the Script
+  const onDbl = async en => { await openFile(en.path); if (/\.py$/i.test(en.path)) { setScript(en.path); toast('Script: ' + S.cfg.script); } };
+  (r.entries || []).forEach(e => t.appendChild(treeNode(e, 0, onFile, null, onDbl)));
+  markScriptRow();
+}
+function markScriptRow() {
+  document.querySelectorAll('#tree .ti').forEach(r => r.classList.toggle('run', !r.classList.contains('dir') && !!S.cfg.script && (r.title === S.cfg.script || rel(r.title) === S.cfg.script)));
 }
 const rel = p => { const r = S.cfg.root || ''; return r && p.startsWith(r) ? p.slice(r.length).replace(/^[\\/]/, '') : p; };
-function setScript(p) { S.cfg.script = rel(p); $('#script').value = S.cfg.script; pushCfg(); }
+function setScript(p) { S.cfg.script = rel(p); $('#script').value = S.cfg.script; pushCfg(); markScriptRow(); }
 function showModal(title) { $('#mtitle').textContent = title; $('#mctl').textContent = ''; $('#modal').classList.add('on'); }
 $('#mclose').onclick = () => { $('#modal').classList.remove('on'); S.tbl = null; };
-function showHelp() { showModal('Help — manual'); const b = $('#mbody'); b.innerHTML = MANUAL; b.scrollTop = 0; }
-$('#bhelp').onclick = showHelp;
 async function browse(path) {
   showModal('Select folder');
   const body = $('#mbody'); body.textContent = '';
   const r = await get('ls', {path: path || S.cfg.root || ''});
   const top = el('div', 'msg', r.path || '(computer)'); body.appendChild(top);
-  const pick = el('button', null, 'Use this folder'); pick.style.margin = '0 12px 8px'; pick.disabled = !r.path;
+  const pick = el('button', null, 'Use this folder'); pick.style.margin = '0 1em .5em'; pick.disabled = !r.path;
   pick.onclick = () => { $('#modal').classList.remove('on'); $('#root').value = r.path; applyRoot(); };
   body.appendChild(pick);
   if (r.parent !== null && r.path) { const up = el('div', 'ti dir', '↑ ..'); up.onclick = () => browse(r.parent); body.appendChild(up); }
@@ -1372,14 +1726,14 @@ async function browse(path) {
 }
 function applyRoot() { S.cfg.root = $('#root').value.trim(); pushCfg(); loadTree(); }
 
-
+/* ---------------- manual ---------------- */
 const MANUAL = `<div class="man">
 <h2>Quick start</h2>
 <ol>
-<li>Type a folder path in <b>Folder</b> and press Enter (or <b>Browse…</b>). The file tree appears on the left.</li>
-<li>Click a <code>.py</code> file. It opens in the editor and becomes the <b>Script</b> to run.</li>
+<li>Type a folder path in <b>Folder</b> and press Enter (or <b>Browse…</b>). The file tree appears on the left. The tool remembers your last folder, script and settings.</li>
+<li>Click a <code>.py</code> file to open it in the editor. <b>Double-click</b> a file to make it the <b>Script</b> that Run/Restart launches (marked with ▶ in the tree; the first file you open is chosen automatically). Opening other files, e.g. to set breakpoints, never changes the Script.</li>
 <li>Click in the gutter (left of a line number) to set a breakpoint <span class="sw"></span>. Click again to remove it.</li>
-<li>Press <b>Run</b>. Execution stops at your first breakpoint and the top line turns red: <b>PAUSED</b>.</li>
+<li>Press <b>Run</b>. Execution stops at your first breakpoint and the line turns accent-colored: <b>PAUSED</b>.</li>
 <li>Step with the toolbar or the keyboard, inspect variables on the right, type Python in the terminal at the bottom.</li>
 </ol>
 
@@ -1392,36 +1746,60 @@ const MANUAL = `<div class="man">
 <tr><td><b>Step Into</b></td><td><kbd>F11</kbd></td><td>If the current line calls a function, stop on its first line, <i>even if it is defined in another file</i> (that file opens in a new tab). Otherwise acts like Step Over.</td></tr>
 <tr><td><b>Step Out</b></td><td><kbd>Shift</kbd>+<kbd>F11</kbd></td><td>Run until the current function returns, then stop in the caller.</td></tr>
 <tr><td><b>Stop</b></td><td></td><td>Kill the program. Always works, paused or running.</td></tr>
-<tr><td><b>Restart</b></td><td></td><td>Stop and run again with the current settings. Breakpoints and watches are kept.</td></tr>
+<tr><td><b>Restart</b></td><td></td><td>Stop and run again with the current settings and the code on disk. Breakpoints and watches are kept.</td></tr>
+<tr><td><b>Save</b></td><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>Save the current file (see Editing).</td></tr>
+<tr><td><b>A− / A+</b></td><td><kbd>Ctrl</kbd>+<kbd>−</kbd> / <kbd>+</kbd></td><td>Make only the text smaller / larger.</td></tr>
+<tr><td><b>Settings</b></td><td></td><td>Font size, theme, accent color, environment variables.</td></tr>
 <tr><td><b>Help</b></td><td><kbd>F1</kbd></td><td>This manual. <kbd>Esc</kbd> closes any pop-up.</td></tr>
 </table>
 <p>On a Mac laptop the F-keys may need <kbd>fn</kbd>; the buttons always work. Step buttons are only enabled while paused.</p>
 
+<h2>Editing code</h2>
+<ul>
+<li>The editor is always editable: click in the code and type. A <b>●</b> on the tab and the word <i>modified</i> show unsaved changes.</li>
+<li><kbd>Ctrl</kbd>+<kbd>S</kbd> (or the Save button) writes the file to disk. Line endings (LF / CRLF) are preserved.</li>
+<li><kbd>Tab</kbd> inserts 4 spaces; with several lines selected it indents them; <kbd>Shift</kbd>+<kbd>Tab</kbd> un-indents. <kbd>Enter</kbd> keeps the indentation and adds 4 more after a line ending in <code>:</code>. <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> undo and redo; copy, paste and select-all work as usual.</li>
+<li><b>A running program is not changed by edits.</b> Save, then press <b>Restart</b> to run the new code. While you are paused, the marker lines refer to the code as it was when the program started.</li>
+<li>When you save, breakpoints below your edit move with the code (if you inserted or deleted lines above them); breakpoints on lines you deleted are dropped.</li>
+<li>Files outside the project folder (libraries you stepped into) and files that are not valid UTF-8 open <b>read-only</b>.</li>
+<li>Not included: autocomplete, search/replace, multi-cursor, code folding. Use your normal editor for heavy refactoring.</li>
+</ul>
+
 <h2>Settings row</h2>
 <table>
 <tr><td><b>Folder</b></td><td>The project root. It is also the working directory of your script, so relative paths such as <code>data/x.csv</code> resolve from here.</td></tr>
-<tr><td><b>Script</b></td><td>File to run (relative to Folder). Set automatically when you click a .py file; you can edit it.</td></tr>
+<tr><td><b>Script</b></td><td>File to run (relative to Folder). Set by double-clicking a file in the tree (or typing here). Run and Restart always launch this file, not the tab you are looking at.</td></tr>
 <tr><td><b>Args</b></td><td>Command-line arguments, as you would type them after <code>python script.py</code>. Quotes work.</td></tr>
 <tr><td><b>Python</b></td><td>Interpreter used to run the script (e.g. a venv's <code>python.exe</code>). Defaults to the one that started this tool.</td></tr>
 <tr><td><b>stop on entry</b></td><td>Pause on the very first line instead of running to a breakpoint.</td></tr>
 <tr><td><b>just my code</b></td><td>On: stepping never enters the standard library or installed packages (it steps over them). Off: you can step into any code, e.g. <code>json/__init__.py</code>. Can be toggled while running.</td></tr>
 </table>
 
+<h2>Settings menu (⚙) and the settings file</h2>
+<ul>
+<li><b>Text-only zoom</b>: the <b>A−</b> / <b>A+</b> buttons in the toolbar, <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>Ctrl</kbd>+<kbd>−</kbd> (<kbd>Cmd</kbd> on Mac), <kbd>Ctrl</kbd>+scroll wheel, and <kbd>Ctrl</kbd>+<kbd>0</kbd> to reset. They change <i>only the size of the text</i> (code, panels, tables, console); panel sizes stay as you set them, unlike the browser's own zoom (its menu still works as usual and scales everything).</li>
+<li><b>Font size</b> (also settable here by number), <b>font family</b>, <b>line spacing</b>.</li>
+<li><b>Theme</b>: Light or Dark. <b>Accent color</b>: pick a swatch, the color box, or type a hex value like <code>#d71e28</code>; shades for highlights are derived from it.</li>
+<li><b>Environment variables</b>: your script always inherits the environment of the terminal that started this tool. In addition you can add <code>KEY=VALUE</code> lines here (one per line, <code>#</code> for comments, <code>$OTHER</code>/<code>%OTHER%</code> are expanded), and tick <i>load .env from the project folder</i>. Order of precedence: this list overrides <code>.env</code>, which overrides the inherited environment.</li>
+<li>Everything is saved automatically to <code>debugger_settings.json</code> next to <code>debugger.py</code> (or in your home folder if that folder is not writable) and loaded on the next start, so the page opens already themed. It also remembers the last folder, script, arguments, breakpoints and watches. <b>Do not put secrets in it</b>: it is a plain text file. Export secrets in your shell instead.</li>
+<li><b>Reset to defaults</b> restores the look; delete the file to forget everything.</li>
+</ul>
+
 <h2>Breakpoints</h2>
 <ul>
 <li>Click the gutter. Blank lines and comment-only lines cannot hold breakpoints.</li>
-<li>You can add or remove breakpoints <i>while the program is running</i>; they take effect immediately.</li>
-<li>Breakpoints work in any file you open, including files you stepped into. They survive a page reload but are not saved when you stop the tool.</li>
+<li>You can add or remove breakpoints at any time: <i>while the program runs, and also while it is paused at another breakpoint</i>. They take effect immediately, so Continue will stop at a breakpoint you just added further down the code, in the same function, in a caller, in another file, or later in a loop.</li>
+<li>Breakpoints work in any file you open, including files you stepped into, and are remembered in the settings file.</li>
 </ul>
 
 <h2>Reading the editor</h2>
 <ul>
-<li><span class="sw"></span> red dot: a breakpoint.</li>
-<li><b>Red-tinted line with ▶ and a red bar</b>: where execution is now (the selected stack frame). It flashes briefly each time you step so you can find it.</li>
-<li><b>Small dot + faint red line</b>: the line you just stepped <i>from</i>, so you can see which way you moved.</li>
-<li><b>Faint red tint</b>: the line in each caller (other stack frames) that is waiting for the call to return.</li>
-<li><b>Red hatched line</b>: where an uncaught exception was raised.</li>
-<li>Tabs: every file you open or step into gets a tab; <b>×</b> closes it.</li>
+<li><span class="sw"></span> dot: a breakpoint.</li>
+<li><b>Tinted line with ▶ and a colored bar</b>: where execution is now (the selected stack frame). It flashes briefly each time you step so you can find it.</li>
+<li><b>Small dot + faint tint</b>: the line you just stepped <i>from</i>, so you can see which way you moved.</li>
+<li><b>Faint tint</b>: the line in each caller (other stack frames) that is waiting for the call to return.</li>
+<li><b>Hatched line</b>: where an uncaught exception was raised.</li>
+<li>Tabs: every file you open or step into gets a tab; <b>×</b> closes it (and re-reads it from disk next time).</li>
 </ul>
 
 <h2>Call stack (top right)</h2>
@@ -1432,16 +1810,16 @@ const MANUAL = `<div class="man">
 <li><b>Locals</b> (inside a function) and <b>Globals</b> (module level; modules, functions and classes are hidden to reduce noise).</li>
 <li>Click a row with ▸ to expand: lists, tuples, dicts, sets, enums, objects (their attributes), numpy arrays, DataFrame columns, Series. Long containers load 100 items at a time ("… more").</li>
 <li>Rows stay expanded while you keep stepping.</li>
-<li>A value with a <span style="background:var(--red-l);outline:1px solid var(--red-m);color:var(--red-d);padding:0 3px">red tint</span> changed since the previous stop.</li>
+<li>A value with an <span style="background:var(--ac-l);outline:1px solid var(--ac-m);color:var(--ac-d);padding:0 3px">accent tint</span> changed since the previous stop.</li>
 <li><b>view</b> button (DataFrame, Series, 1-D/2-D numpy array) opens a paged table with dtypes; use the row/column arrows for big data.</li>
 <li>Long values are shortened in the row; print them in the terminal (<code>p name</code>) to see everything.</li>
 </ul>
 
 <h2>Watch</h2>
-<p>Type any expression (e.g. <code>len(items)</code>, <code>df.shape</code>, <code>total &gt; 100</code>) and press Enter. It is re-evaluated at every stop in the selected frame. Errors are shown in red instead of a value. <b>×</b> removes a watch. Watches must not have side effects.</p>
+<p>Type any expression (e.g. <code>len(items)</code>, <code>df.shape</code>, <code>total &gt; 100</code>) and press Enter. It is re-evaluated at every stop in the selected frame. Errors are shown instead of a value. <b>×</b> removes a watch. Watches must not have side effects.</p>
 
 <h2>Console &amp; terminal (bottom)</h2>
-<p>The area shows your program's output (stderr in red italics). The prompt <code>&gt;&gt;&gt;</code> works in two modes:</p>
+<p>The area shows your program's output (stderr in accent italics). The prompt <code>&gt;&gt;&gt;</code> works in two modes:</p>
 <ul>
 <li><b>Paused:</b> a Python prompt that runs <i>inside the selected frame</i>, with that frame's variables.
 <ul>
@@ -1457,19 +1835,18 @@ const MANUAL = `<div class="man">
 <div class="nt">Assigning to a <i>new</i> name inside a function frame (not an existing variable) creates it in the terminal's scope only; the running function will not see it. Existing variables, globals, and mutations of lists/dicts/objects always take effect.</div>
 
 <h2>Exceptions</h2>
-<p>If the script ends with an uncaught exception, the program pauses at the failing line (red hatching) with the full stack intact, as in a post-mortem debugger. Inspect variables, walk the call stack, evaluate in the terminal. <b>Continue</b> (or Stop) then ends the program with exit code 1. Exceptions that your code catches do not pause.</p>
+<p>If the script ends with an uncaught exception, the program pauses at the failing line (hatched) with the full stack intact, as in a post-mortem debugger. Inspect variables, walk the call stack, evaluate in the terminal. <b>Continue</b> (or Stop) then ends the program with exit code 1. Exceptions that your code catches do not pause.</p>
 
 <h2>The status line</h2>
-<p>The thin line at the very top: <b>gray</b> = idle, <b>dark</b> = running, <b>red</b> = paused. The text on the right says why you are paused (<i>breakpoint</i>, <i>step</i>, <i>entry</i>, <i>exception</i>) and where.</p>
+<p>The thin line at the very top: <b>gray</b> = idle, <b>dark</b> = running, <b>accent</b> = paused. The text on the right says why you are paused (<i>breakpoint</i>, <i>step</i>, <i>entry</i>, <i>exception</i>) and where.</p>
 
 <h2>Layout</h2>
-<p>Drag the thin bars between panels to resize the file tree, the right-hand column and the console.</p>
+<p>Drag the thin bars between panels to resize the file tree, the right-hand column and the console. Sizes are remembered.</p>
 
 <h2>Limits &amp; good to know</h2>
 <ul>
 <li>Only the <b>main thread</b> is debugged; code in other threads or processes is not stopped by breakpoints.</li>
 <li>Debugging is slower than normal execution (about 0.7 µs per Python function call). Code with no breakpoints in a file runs nearly full speed.</li>
-<li>The viewer is read-only: edit files in your editor, then press Restart. Closing a tab and clicking the file again re-reads it from disk.</li>
 <li>Big objects: only short previews are computed; expand rows to see more, so the tool stays fast on large DataFrames.</li>
 <li>The page works only through the URL printed in the terminal (it contains a private token, localhost only). If you see "forbidden", open the exact URL again. Close the tool with <kbd>Ctrl</kbd>+<kbd>C</kbd> in the terminal that started it.</li>
 </ul>
@@ -1477,12 +1854,67 @@ const MANUAL = `<div class="man">
 <h2>Troubleshooting</h2>
 <table>
 <tr><td>Nothing happens on Run</td><td>Check the Script field and the console for <code>[script not found]</code>.</td></tr>
-<tr><td>Breakpoint never hits</td><td>The line may not execute (e.g. inside an unused branch), or the file differs from the one that actually runs (a copy elsewhere, or an installed package). Step into the call to see which file is used.</td></tr>
+<tr><td>Breakpoint never hits</td><td>The line may not execute (e.g. inside an unused branch), or the file differs from the one that actually runs (a copy elsewhere, or an installed package). Step into the call to see which file is used. If you edited the file, Save and Restart.</td></tr>
 <tr><td>Wrong packages / import errors</td><td>Point <b>Python</b> at your project's interpreter.</td></tr>
 <tr><td>Step Into doesn't enter a library call</td><td>That is <i>just my code</i>. Untick it to step into library code.</td></tr>
 <tr><td>Program waits forever</td><td>It may be waiting for <code>input()</code>: type the answer in the terminal prompt.</td></tr>
+<tr><td>Save fails</td><td>The file may be read-only on disk or locked by another program (common on Windows).</td></tr>
 </table>
 </div>`;
+
+/* ---------------- settings menu ---------------- */
+let prefsTimer = 0;
+function savePrefsSoon() { clearTimeout(prefsTimer); prefsTimer = setTimeout(() => post('prefs', {prefs: S.prefs}), 250); }
+function setPref(k, v) { S.prefs[k] = v; applyPrefs(S.prefs); savePrefsSoon(); if ($('#modal').classList.contains('on') && $('#mtitle').textContent === 'Settings') showSettings(); }
+let cfgTimer = 0;
+function pushCfgSoon() { clearTimeout(cfgTimer); cfgTimer = setTimeout(pushCfg, 300); }
+const ACCENTS = [['Red', '#d71e28'], ['Blue', '#1f6feb'], ['Green', '#1a7f37'], ['Orange', '#c8610a'], ['Purple', '#8250df'], ['Gray', '#555555']];
+function showSettings() {
+  showModal('Settings');
+  const b = $('#mbody'), keep = b.scrollTop; b.textContent = '';
+  const w = el('div', 'man'); b.appendChild(w);
+  const P = S.prefs;
+  const row = (label, ...ctl) => { const r = el('div', 'srow'); r.appendChild(el('label', null, label)); const c = el('div', 'sctl'); ctl.forEach(x => c.appendChild(x)); r.appendChild(c); w.appendChild(r); return c; };
+  w.appendChild(el('h2', null, 'Appearance'));
+  const fs = el('input'); fs.type = 'number'; fs.min = 9; fs.max = 32; fs.value = P.font_size;
+  const setFs = v => setPref('font_size', Math.max(9, Math.min(32, Math.round(+v) || 14)));
+  const dec = el('button', null, 'A−'), inc = el('button', null, 'A+');
+  dec.onclick = () => setFs(P.font_size - 1); inc.onclick = () => setFs(P.font_size + 1); fs.onchange = () => setFs(fs.value);
+  row('Font size', dec, fs, el('span', null, 'px'), inc);
+  const ff = el('select'); [['default', 'Consolas / Menlo (default)'], ['courier', 'Courier New'], ['lucida', 'Lucida Console / Monaco'], ['system', 'System monospace'], ['sans', 'Sans-serif']]
+    .forEach(([k, n]) => { const o = el('option', null, n); o.value = k; if (P.font === k) o.selected = true; ff.appendChild(o); });
+  ff.onchange = () => setPref('font', ff.value); row('Font', ff);
+  const ls = el('select'); [['compact', 'Compact'], ['normal', 'Normal'], ['relaxed', 'Relaxed']]
+    .forEach(([k, n]) => { const o = el('option', null, n); o.value = k; if (P.line === k) o.selected = true; ls.appendChild(o); });
+  ls.onchange = () => setPref('line', ls.value); row('Line spacing', ls);
+  const tl = el('button', 'tgl' + (P.theme === 'light' ? ' on' : ''), 'Light'), td = el('button', 'tgl' + (P.theme === 'dark' ? ' on' : ''), 'Dark');
+  tl.onclick = () => setPref('theme', 'light'); td.onclick = () => setPref('theme', 'dark'); row('Theme', tl, td);
+  const sw = ACCENTS.map(([n, h]) => { const x = el('button', 'sw2' + (P.accent.toLowerCase() === h ? ' on' : '')); x.style.background = h; x.title = n; x.onclick = () => setPref('accent', h); return x; });
+  const col = el('input'); col.type = 'color'; col.value = P.accent.length === 7 ? P.accent : '#d71e28'; col.onchange = () => setPref('accent', col.value);
+  const hx = el('input'); hx.type = 'text'; hx.size = 8; hx.value = P.accent; hx.onchange = () => { if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(hx.value.trim())) setPref('accent', hx.value.trim()); else hx.value = P.accent; };
+  row('Accent color', ...sw, col, hx);
+  w.appendChild(el('h2', null, 'Environment for the program'));
+  const env = el('textarea', 'fld'); env.spellcheck = false; env.placeholder = 'API_URL=http://localhost:8000\nDEBUG=1\n# one KEY=VALUE per line'; env.value = S.cfg.env || '';
+  env.oninput = () => { S.cfg.env = env.value; pushCfgSoon(); };
+  row('Variables', env);
+  const de = el('input'); de.type = 'checkbox'; de.checked = !!S.cfg.dotenv; de.onchange = () => { S.cfg.dotenv = de.checked; pushCfg(); };
+  const dl = el('label'); dl.appendChild(de); dl.appendChild(document.createTextNode(' load .env from the project folder')); row('.env file', dl);
+  w.appendChild(el('p', 'msg', 'The program also inherits every variable of the terminal that started this tool. This list overrides .env, which overrides the inherited environment. Applied at the next Run.'));
+  w.appendChild(el('h2', null, 'Settings file'));
+  w.appendChild(el('p', null, S.settingsPath || '(not available)'));
+  if (S.settingsError) w.appendChild(el('p', 'nt', S.settingsError));
+  const rs = el('button', null, 'Reset appearance to defaults');
+  rs.onclick = async () => { const r = await post('prefs', {reset: true}); S.prefs = r.prefs; applyPrefs(S.prefs); showSettings(); };
+  w.appendChild(rs);
+  b.scrollTop = keep;
+}
+function showHelp() { showModal('Help — manual'); const b = $('#mbody'); b.innerHTML = MANUAL; b.scrollTop = 0; }
+$('#bhelp').onclick = showHelp; $('#bset').onclick = showSettings;
+/* text-only zoom: changes the font size, never the layout */
+function zoomText(delta) { setPref('font_size', Math.max(9, Math.min(32, delta === 0 ? 14 : S.prefs.font_size + delta))); }
+$('#bfm').onclick = () => zoomText(-1); $('#bfp').onclick = () => zoomText(1);
+let wheelAt = 0;
+document.addEventListener('wheel', e => { if (!(e.ctrlKey || e.metaKey)) return; e.preventDefault(); const t = Date.now(); if (t - wheelAt < 60) return; wheelAt = t; zoomText(e.deltaY < 0 ? 1 : -1); }, {passive: false});
 
 /* ---------------- config / controls ---------------- */
 function readCfg() {
@@ -1494,18 +1926,21 @@ function pushCfg() { post('config', readCfg()); }
 function writeCfg() {
   $('#root').value = S.cfg.root || ''; $('#script').value = S.cfg.script || ''; $('#args').value = S.cfg.args || '';
   $('#python').value = S.cfg.python || ''; $('#soe').checked = !!S.cfg.stop_on_entry; $('#jmc').checked = S.cfg.jmc !== false;
+  markScriptRow();
 }
-['script', 'args', 'python'].forEach(id => $('#' + id).addEventListener('change', pushCfg));
+['script', 'args', 'python'].forEach(id => $('#' + id).addEventListener('change', () => { pushCfg(); markScriptRow(); }));
 ['soe', 'jmc'].forEach(id => $('#' + id).addEventListener('change', pushCfg));
 $('#root').addEventListener('keydown', e => { if (e.key === 'Enter') applyRoot(); });
 $('#bopen').onclick = applyRoot; $('#bbrowse').onclick = () => browse(S.cfg.root);
 const run = () => { out('sys', ''); post('run', readCfg()); };
 $('#brun').onclick = run; $('#brestart').onclick = run;
 $('#bstop').onclick = () => post('stop');
-const cmd = n => () => { if (S.state === 'paused') post(n); };
+const cmd = n => async () => { if (S.state === 'paused') { await breakSync; post(n); } };   // breakpoint edits always arrive before Continue/Step
 $('#bcont').onclick = cmd('continue'); $('#bnext').onclick = cmd('next'); $('#bstep').onclick = cmd('step'); $('#bout').onclick = cmd('out');
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { $('#mclose').click(); }
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 's') { e.preventDefault(); saveFile(S.files.get(S.active)); }
+  else if ((e.ctrlKey || e.metaKey) && !e.altKey && ['=', '+', '-', '_', '0'].includes(e.key)) { e.preventDefault(); zoomText(e.key === '0' ? 0 : (e.key === '-' || e.key === '_') ? -1 : 1); }
+  else if (e.key === 'Escape') { $('#mclose').click(); }
   else if (e.key === 'F1') { e.preventDefault(); showHelp(); }
   else if (e.key === 'F8') { e.preventDefault(); cmd('continue')(); }
   else if (e.key === 'F10') { e.preventDefault(); cmd('next')(); }
@@ -1532,7 +1967,7 @@ function out(kind, text) {
   if (atEnd) OUT.scrollTop = OUT.scrollHeight;
 }
 const INP = $('#in');
-function fit() { INP.style.height = 'auto'; INP.style.height = Math.min(110, INP.scrollHeight) + 'px'; }
+function fit() { INP.style.height = 'auto'; INP.style.height = Math.min(parseFloat(getComputedStyle(INP).maxHeight) || 110, INP.scrollHeight) + 'px'; }
 INP.addEventListener('input', fit);
 INP.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
@@ -1674,14 +2109,18 @@ async function onStopped(m) {
 function onEvent(m) {
   switch (m.t) {
     case 'snapshot':
-      S.cfg = m.cfg; writeCfg(); S.watches = m.watches || [];
+      S.cfg = m.cfg; writeCfg(); S.watches = m.watches || []; S.settingsPath = m.settings_path; S.settingsError = m.settings_error;
+      if (m.prefs) { S.prefs = m.prefs; applyPrefs(S.prefs); }
       S.breaks = new Map(Object.entries(m.breaks).map(([p, l]) => [p, new Set(l)]));
       OUT.textContent = ''; m.output.forEach(([k, t]) => out(k, t));
       if (!$('#tree').firstChild) loadTree();
       if (m.stop) { S.stop = m.stop; onStopped(Object.assign({vars: m.vars}, m.stop)); } else { S.stop = null; renderStack(); renderVars(null); renderWatchOnly(); marks(); }
       setState(m.state, m.status); break;
-    case 'state': if (S.stop && m.state === 'running') { const t = S.stop.stack[S.stop.idx]; S.lastPos = {file: t.file, line: t.line}; } if (m.state === 'idle') S.lastPos = S.trail = null;
-      if (m.state !== 'paused') { S.stop = null; renderStack(); marks(); if (m.state === 'idle') { renderVars(null); renderWatchOnly(); } } setState(m.state, m.status); break;
+    case 'state':
+      if (S.stop && m.state === 'running') { const t = S.stop.stack[S.stop.idx]; S.lastPos = {file: t.file, line: t.line}; }
+      if (m.state === 'idle') S.lastPos = S.trail = null;
+      if (m.state !== 'paused') { S.stop = null; renderStack(); marks(); if (m.state === 'idle') { renderVars(null); renderWatchOnly(); } }
+      setState(m.state, m.status); break;
     case 'output': out(m.stream, m.text); break;
     case 'stopped': onStopped(m); break;
     case 'vars': renderVars(m); break;
@@ -1699,15 +2138,20 @@ function onEvent(m) {
 new EventSource('/events?t=' + encodeURIComponent(TOKEN)).onmessage = e => onEvent(JSON.parse(e.data));
 setState('idle', '');
 
-/* ---------------- splitters ---------------- */
+/* ---------------- splitters (sizes are remembered) ---------------- */
 document.querySelectorAll('.split').forEach(s => s.addEventListener('mousedown', e => {
   e.preventDefault();
-  const v = s.dataset.v, d = +s.dataset.d, st = s.classList.contains('h') ? e.clientY : e.clientX;
-  const root = document.documentElement, start = parseFloat(getComputedStyle(root).getPropertyValue(v));
-  const mv = ev => { const cur = s.classList.contains('h') ? ev.clientY : ev.clientX; root.style.setProperty(v, Math.max(80, start + d * (cur - st)) + 'px'); };
-  const up = () => { document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); };
+  const v = s.dataset.v, d = +s.dataset.d, horiz = s.classList.contains('h'), st = horiz ? e.clientY : e.clientX;
+  const root = document.documentElement;
+  const start = v === '--left' ? $('#files').offsetWidth : v === '--right' ? $('#rt').offsetWidth : $('#cons').offsetHeight;
+  const mv = ev => { const cur = horiz ? ev.clientY : ev.clientX; root.style.setProperty(v, Math.max(80, Math.round(start + d * (cur - st))) + 'px'); };
+  const up = () => {
+    document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up);
+    S.prefs.layout = Object.assign({}, S.prefs.layout, {[v.slice(2)]: parseInt(root.style.getPropertyValue(v))}); savePrefsSoon();
+  };
   document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
 }));
+window.addEventListener('beforeunload', e => { if ([...S.files.values()].some(f => f.dirty)) { e.preventDefault(); e.returnValue = ''; } });
 </script></body></html>
 """
 
