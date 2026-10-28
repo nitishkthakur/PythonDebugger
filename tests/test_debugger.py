@@ -222,6 +222,34 @@ class DebuggerTests(unittest.TestCase):
             self.h.post("stop")
             self.h.idle()
 
+    def test_step_into_function_from_another_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "pkg"))
+            with open(os.path.join(d, "pkg", "__init__.py"), "w") as fh:
+                fh.write("")
+            helper = os.path.join(d, "pkg", "helper.py")
+            with open(helper, "w") as fh:
+                fh.write("def double(x):\n    y = x * 2\n    return y\n")
+            main = os.path.join(d, "main.py")
+            with open(main, "w") as fh:
+                fh.write("from pkg.helper import double\nvalue = 21\nresult = double(value)\nprint(result)\n")
+            self.h.sess.cfg["root"] = d
+            self.h.post("breaks", {"files": {os.path.realpath(main): [3]}})
+            self.h.post("run", {"script": main})
+            self.h.paused()
+            self.h.cmd("step")
+            st = self.h.wait(lambda s: s["state"] == "paused" and s["stop"]["stack"][-1]["func"] == "double")
+            top = st["stop"]["stack"][-1]
+            self.assertEqual(os.path.realpath(top["file"]), os.path.realpath(helper))   # editor will open helper.py
+            self.assertEqual(top["line"], 2)
+            self.assertEqual([os.path.basename(f["file"]) for f in st["stop"]["stack"]], ["main.py", "helper.py"])
+            self.assertEqual(self.h.names(st)["x"]["value"], "21")
+            self.h.cmd("out")                                       # and back into main.py
+            st = self.h.wait(lambda s: s["state"] == "paused" and s["stop"]["stack"][-1]["func"] == "<module>")
+            self.assertEqual(os.path.basename(st["stop"]["stack"][-1]["file"]), "main.py")
+            self.h.post("stop")
+            self.h.idle()
+
     def test_just_my_code_toggle(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "t.py")

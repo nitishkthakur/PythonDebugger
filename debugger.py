@@ -1148,6 +1148,16 @@ body[data-state=paused] #status{color:var(--red)}
 #stackp{max-height:150px}#watchp{max-height:140px}#varp{flex:1 !important}
 #wadd{display:flex;border-top:1px solid #ddd;flex:none}#wadd input{flex:1;border:0;padding:2px 6px;outline:0}
 .wx{color:var(--dim);cursor:pointer;margin-left:auto;padding-left:8px}
+/* manual */
+.man{padding:6px 22px 18px;line-height:1.55;max-width:860px}
+.man h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid var(--red);padding-bottom:2px;margin:18px 0 6px}
+.man h3{font-size:12px;margin:10px 0 2px}
+.man p{margin:3px 0}.man ul{margin:3px 0;padding-left:20px}
+.man kbd{border:1px solid #999;border-bottom-width:2px;background:#f4f4f4;padding:0 4px;font:inherit;white-space:nowrap}
+.man table{border-collapse:collapse;margin:4px 0}.man td,.man th{border:1px solid #ccc;padding:2px 8px;text-align:left;vertical-align:top}
+.man th{background:#eee}.man code{background:#f0f0f0;padding:0 3px}
+.man .sw{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--red);vertical-align:-1px}
+.man .nt{background:var(--red-xl);border-left:3px solid var(--red);padding:3px 8px;margin:6px 0}
 /* modal */
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:10}
 #modal.on{display:flex}
@@ -1173,7 +1183,7 @@ table.t .dt{font-weight:normal;color:var(--dim);font-size:10px;display:block}
   <button id="brun">Run</button><button id="bcont" title="F8">Continue</button><button id="bnext" title="F10">Step Over</button>
   <button id="bstep" title="F11">Step Into</button><button id="bout" title="Shift+F11">Step Out</button>
   <button id="bstop">Stop</button><button id="brestart">Restart</button>
-  <span id="status">idle</span>
+  <span id="status">idle</span><button id="bhelp" title="F1">? Help</button>
 </div>
 <div id="main">
   <div class="panel"><div class="ph">Files</div><div class="pb" id="tree"></div></div>
@@ -1259,7 +1269,7 @@ async function openFile(path, line) {
 }
 function closeTab(p) {
   const i = S.tabs.indexOf(p); if (i < 0) return;
-  S.tabs.splice(i, 1);
+  S.tabs.splice(i, 1); S.files.delete(p);  // reopening re-reads the file from disk
   if (S.active === p) S.active = S.tabs[Math.min(i, S.tabs.length - 1)] || null;
   renderTabs(); renderCode();
 }
@@ -1347,6 +1357,8 @@ const rel = p => { const r = S.cfg.root || ''; return r && p.startsWith(r) ? p.s
 function setScript(p) { S.cfg.script = rel(p); $('#script').value = S.cfg.script; pushCfg(); }
 function showModal(title) { $('#mtitle').textContent = title; $('#mctl').textContent = ''; $('#modal').classList.add('on'); }
 $('#mclose').onclick = () => { $('#modal').classList.remove('on'); S.tbl = null; };
+function showHelp() { showModal('Help — manual'); const b = $('#mbody'); b.innerHTML = MANUAL; b.scrollTop = 0; }
+$('#bhelp').onclick = showHelp;
 async function browse(path) {
   showModal('Select folder');
   const body = $('#mbody'); body.textContent = '';
@@ -1359,6 +1371,118 @@ async function browse(path) {
   (r.entries || []).forEach(e => { const d = el('div', 'ti dir', e.name); d.onclick = () => browse(e.path); body.appendChild(d); });
 }
 function applyRoot() { S.cfg.root = $('#root').value.trim(); pushCfg(); loadTree(); }
+
+
+const MANUAL = `<div class="man">
+<h2>Quick start</h2>
+<ol>
+<li>Type a folder path in <b>Folder</b> and press Enter (or <b>Browse…</b>). The file tree appears on the left.</li>
+<li>Click a <code>.py</code> file. It opens in the editor and becomes the <b>Script</b> to run.</li>
+<li>Click in the gutter (left of a line number) to set a breakpoint <span class="sw"></span>. Click again to remove it.</li>
+<li>Press <b>Run</b>. Execution stops at your first breakpoint and the top line turns red: <b>PAUSED</b>.</li>
+<li>Step with the toolbar or the keyboard, inspect variables on the right, type Python in the terminal at the bottom.</li>
+</ol>
+
+<h2>Toolbar &amp; keyboard</h2>
+<table>
+<tr><th>Control</th><th>Key</th><th>What it does</th></tr>
+<tr><td><b>Run</b></td><td></td><td>Start the script under the debugger. Runs until a breakpoint, an uncaught exception, or the end.</td></tr>
+<tr><td><b>Continue</b></td><td><kbd>F8</kbd></td><td>Run until the next breakpoint (or the end).</td></tr>
+<tr><td><b>Step Over</b></td><td><kbd>F10</kbd></td><td>Run the current line completely, including any function it calls, and stop at the next line in this function.</td></tr>
+<tr><td><b>Step Into</b></td><td><kbd>F11</kbd></td><td>If the current line calls a function, stop on its first line, <i>even if it is defined in another file</i> (that file opens in a new tab). Otherwise acts like Step Over.</td></tr>
+<tr><td><b>Step Out</b></td><td><kbd>Shift</kbd>+<kbd>F11</kbd></td><td>Run until the current function returns, then stop in the caller.</td></tr>
+<tr><td><b>Stop</b></td><td></td><td>Kill the program. Always works, paused or running.</td></tr>
+<tr><td><b>Restart</b></td><td></td><td>Stop and run again with the current settings. Breakpoints and watches are kept.</td></tr>
+<tr><td><b>Help</b></td><td><kbd>F1</kbd></td><td>This manual. <kbd>Esc</kbd> closes any pop-up.</td></tr>
+</table>
+<p>On a Mac laptop the F-keys may need <kbd>fn</kbd>; the buttons always work. Step buttons are only enabled while paused.</p>
+
+<h2>Settings row</h2>
+<table>
+<tr><td><b>Folder</b></td><td>The project root. It is also the working directory of your script, so relative paths such as <code>data/x.csv</code> resolve from here.</td></tr>
+<tr><td><b>Script</b></td><td>File to run (relative to Folder). Set automatically when you click a .py file; you can edit it.</td></tr>
+<tr><td><b>Args</b></td><td>Command-line arguments, as you would type them after <code>python script.py</code>. Quotes work.</td></tr>
+<tr><td><b>Python</b></td><td>Interpreter used to run the script (e.g. a venv's <code>python.exe</code>). Defaults to the one that started this tool.</td></tr>
+<tr><td><b>stop on entry</b></td><td>Pause on the very first line instead of running to a breakpoint.</td></tr>
+<tr><td><b>just my code</b></td><td>On: stepping never enters the standard library or installed packages (it steps over them). Off: you can step into any code, e.g. <code>json/__init__.py</code>. Can be toggled while running.</td></tr>
+</table>
+
+<h2>Breakpoints</h2>
+<ul>
+<li>Click the gutter. Blank lines and comment-only lines cannot hold breakpoints.</li>
+<li>You can add or remove breakpoints <i>while the program is running</i>; they take effect immediately.</li>
+<li>Breakpoints work in any file you open, including files you stepped into. They survive a page reload but are not saved when you stop the tool.</li>
+</ul>
+
+<h2>Reading the editor</h2>
+<ul>
+<li><span class="sw"></span> red dot: a breakpoint.</li>
+<li><b>Red-tinted line with ▶ and a red bar</b>: where execution is now (the selected stack frame). It flashes briefly each time you step so you can find it.</li>
+<li><b>Small dot + faint red line</b>: the line you just stepped <i>from</i>, so you can see which way you moved.</li>
+<li><b>Faint red tint</b>: the line in each caller (other stack frames) that is waiting for the call to return.</li>
+<li><b>Red hatched line</b>: where an uncaught exception was raised.</li>
+<li>Tabs: every file you open or step into gets a tab; <b>×</b> closes it.</li>
+</ul>
+
+<h2>Call stack (top right)</h2>
+<p>Innermost call on top. <b>Click any frame</b> to jump the editor to that call site and to show that frame's variables; the terminal and watches then run in that frame too. With <i>just my code</i> on, library frames are hidden.</p>
+
+<h2>Variables</h2>
+<ul>
+<li><b>Locals</b> (inside a function) and <b>Globals</b> (module level; modules, functions and classes are hidden to reduce noise).</li>
+<li>Click a row with ▸ to expand: lists, tuples, dicts, sets, enums, objects (their attributes), numpy arrays, DataFrame columns, Series. Long containers load 100 items at a time ("… more").</li>
+<li>Rows stay expanded while you keep stepping.</li>
+<li>A value with a <span style="background:var(--red-l);outline:1px solid var(--red-m);color:var(--red-d);padding:0 3px">red tint</span> changed since the previous stop.</li>
+<li><b>view</b> button (DataFrame, Series, 1-D/2-D numpy array) opens a paged table with dtypes; use the row/column arrows for big data.</li>
+<li>Long values are shortened in the row; print them in the terminal (<code>p name</code>) to see everything.</li>
+</ul>
+
+<h2>Watch</h2>
+<p>Type any expression (e.g. <code>len(items)</code>, <code>df.shape</code>, <code>total &gt; 100</code>) and press Enter. It is re-evaluated at every stop in the selected frame. Errors are shown in red instead of a value. <b>×</b> removes a watch. Watches must not have side effects.</p>
+
+<h2>Console &amp; terminal (bottom)</h2>
+<p>The area shows your program's output (stderr in red italics). The prompt <code>&gt;&gt;&gt;</code> works in two modes:</p>
+<ul>
+<li><b>Paused:</b> a Python prompt that runs <i>inside the selected frame</i>, with that frame's variables.
+<ul>
+<li>Inspect: <code>x</code>, <code>df.head()</code>, <code>len(items)</code>. Pdb style also works: <code>p x</code>, <code>pp mydict</code>.</li>
+<li><b>Change state:</b> <code>enabled = True</code>, <code>count += 1</code>, <code>items.append(3)</code>. The change is real and the program continues with it; the variables panel updates immediately.</li>
+<li>Statements, imports and one-liners such as <code>for i in range(3): print(i)</code> work. <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a new line, <kbd>Enter</kbd> runs, <kbd>↑</kbd>/<kbd>↓</kbd> browse history.</li>
+<li>Errors print as a normal Python traceback and never break the debugging session.</li>
+<li>Terminal code runs untraced: breakpoints are not hit inside it.</li>
+</ul></li>
+<li><b>Running:</b> what you type is sent to the program's standard input (for <code>input()</code>).</li>
+<li><b>Not running:</b> nothing to talk to; press Run.</li>
+</ul>
+<div class="nt">Assigning to a <i>new</i> name inside a function frame (not an existing variable) creates it in the terminal's scope only; the running function will not see it. Existing variables, globals, and mutations of lists/dicts/objects always take effect.</div>
+
+<h2>Exceptions</h2>
+<p>If the script ends with an uncaught exception, the program pauses at the failing line (red hatching) with the full stack intact, as in a post-mortem debugger. Inspect variables, walk the call stack, evaluate in the terminal. <b>Continue</b> (or Stop) then ends the program with exit code 1. Exceptions that your code catches do not pause.</p>
+
+<h2>The status line</h2>
+<p>The thin line at the very top: <b>gray</b> = idle, <b>dark</b> = running, <b>red</b> = paused. The text on the right says why you are paused (<i>breakpoint</i>, <i>step</i>, <i>entry</i>, <i>exception</i>) and where.</p>
+
+<h2>Layout</h2>
+<p>Drag the thin bars between panels to resize the file tree, the right-hand column and the console.</p>
+
+<h2>Limits &amp; good to know</h2>
+<ul>
+<li>Only the <b>main thread</b> is debugged; code in other threads or processes is not stopped by breakpoints.</li>
+<li>Debugging is slower than normal execution (about 0.7 µs per Python function call). Code with no breakpoints in a file runs nearly full speed.</li>
+<li>The viewer is read-only: edit files in your editor, then press Restart. Closing a tab and clicking the file again re-reads it from disk.</li>
+<li>Big objects: only short previews are computed; expand rows to see more, so the tool stays fast on large DataFrames.</li>
+<li>The page works only through the URL printed in the terminal (it contains a private token, localhost only). If you see "forbidden", open the exact URL again. Close the tool with <kbd>Ctrl</kbd>+<kbd>C</kbd> in the terminal that started it.</li>
+</ul>
+
+<h2>Troubleshooting</h2>
+<table>
+<tr><td>Nothing happens on Run</td><td>Check the Script field and the console for <code>[script not found]</code>.</td></tr>
+<tr><td>Breakpoint never hits</td><td>The line may not execute (e.g. inside an unused branch), or the file differs from the one that actually runs (a copy elsewhere, or an installed package). Step into the call to see which file is used.</td></tr>
+<tr><td>Wrong packages / import errors</td><td>Point <b>Python</b> at your project's interpreter.</td></tr>
+<tr><td>Step Into doesn't enter a library call</td><td>That is <i>just my code</i>. Untick it to step into library code.</td></tr>
+<tr><td>Program waits forever</td><td>It may be waiting for <code>input()</code>: type the answer in the terminal prompt.</td></tr>
+</table>
+</div>`;
 
 /* ---------------- config / controls ---------------- */
 function readCfg() {
@@ -1381,7 +1505,9 @@ $('#bstop').onclick = () => post('stop');
 const cmd = n => () => { if (S.state === 'paused') post(n); };
 $('#bcont').onclick = cmd('continue'); $('#bnext').onclick = cmd('next'); $('#bstep').onclick = cmd('step'); $('#bout').onclick = cmd('out');
 document.addEventListener('keydown', e => {
-  if (e.key === 'F8') { e.preventDefault(); cmd('continue')(); }
+  if (e.key === 'Escape') { $('#mclose').click(); }
+  else if (e.key === 'F1') { e.preventDefault(); showHelp(); }
+  else if (e.key === 'F8') { e.preventDefault(); cmd('continue')(); }
   else if (e.key === 'F10') { e.preventDefault(); cmd('next')(); }
   else if (e.key === 'F11') { e.preventDefault(); e.shiftKey ? cmd('out')() : cmd('step')(); }
 });
