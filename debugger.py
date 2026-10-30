@@ -38,6 +38,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import socketserver
 import subprocess
 import sys
 import sysconfig
@@ -747,7 +748,8 @@ class Dbg(bdb.Bdb):
 
 
 def worker_main(port, script, args):
-    sock = socket.create_connection(("127.0.0.1", port))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect(("127.0.0.1", port))
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     opts = json.loads(os.environ.get("DBG_OPTS", "{}"))
     dbg = Dbg(sock, jmc=opts.get("jmc", True), stop_on_entry=opts.get("stop_on_entry", False))
@@ -775,8 +777,10 @@ def worker_main(port, script, args):
 # ---------------------------------------------------------------------------
 
 DEFAULT_PREFS = {"font_size": 14, "font": "default", "line": "normal", "theme": "light",
-                 "accent": "#d71e28", "layout": {}}
+                 "accent": "#d71e28", "layout": {}, "editor_theme": "match", "editor_colors": {}}
 FONT_KEYS = ("default", "courier", "lucida", "system", "sans")
+THEME_KEYS = ("light", "dark", "midnight", "sepia", "forest", "contrast")
+EDITOR_COLOR_KEYS = ("background", "text", "keyword", "string", "comment", "number", "gutter")
 SESSION_KEYS = ("root", "script", "args", "python", "stop_on_entry", "jmc", "env", "dotenv")
 
 
@@ -792,8 +796,14 @@ def clean_prefs(src, base=None):
         out["font"] = src["font"]
     if src.get("line") in ("compact", "normal", "relaxed"):
         out["line"] = src["line"]
-    if src.get("theme") in ("light", "dark"):
+    if src.get("theme") in THEME_KEYS:
         out["theme"] = src["theme"]
+    if src.get("editor_theme") in ("match",) + THEME_KEYS:
+        out["editor_theme"] = src["editor_theme"]
+    if isinstance(src.get("editor_colors"), dict):
+        out["editor_colors"] = {k: v for k, v in src["editor_colors"].items()
+                                if k in EDITOR_COLOR_KEYS and isinstance(v, str)
+                                and re.fullmatch(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})", v)}
     if isinstance(src.get("accent"), str) and re.fullmatch(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})", src["accent"]):
         out["accent"] = src["accent"]
     if isinstance(src.get("layout"), dict):
@@ -1260,6 +1270,15 @@ def _save_file(root, body):
     return {"ok": True}
 
 
+class LocalHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind calls getfqdn(), which may consult DNS even
+        # for a loopback address. The debugger never needs a resolved name.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
+
+
 def make_handler(sess):
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
@@ -1298,10 +1317,19 @@ def make_handler(sess):
                 return
             if u.path == "/":
                 boot = json.dumps({"prefs": sess.prefs()}).replace("</", "<\\/")
-                data = PAGE_HTML.replace("__BOOT__", boot).encode("utf-8")
+                nonce = secrets.token_urlsafe(18)
+                data = PAGE_HTML.replace("__BOOT__", boot).replace("__NONCE__", nonce).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
+                # The complete UI is embedded. Only same-origin API/SSE connections
+                # are allowed; themes cannot load remote fonts, CSS, or images.
+                self.send_header("Content-Security-Policy", "default-src 'none'; "
+                                 "script-src 'nonce-%s'; style-src 'unsafe-inline'; "
+                                 "connect-src 'self'; base-uri 'none'; form-action 'none'; "
+                                 "frame-ancestors 'none'; object-src 'none'" % nonce)
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(data)
             elif u.path == "/events":
@@ -1370,7 +1398,7 @@ def serve(root, script, port, open_browser, store=None):
     httpd = None
     for p in range(port, port + 50):
         try:
-            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", p), handler)
+            httpd = LocalHTTPServer(("127.0.0.1", p), handler)
             break
         except OSError:
             continue
@@ -1430,8 +1458,8 @@ PAGE_HTML = r"""<!doctype html>
  --btn:#363636;--btnh:#464646;--btnbd:#666;--inp:#171717;--sub:#292929;--spl:#363636;--cd:#333;--sel:#3a3a3a;--off:#666;
  --kw:#fff;--st:#b4b4b4;--cm:#7d7d7d;--nm:#cfcfcf}
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:var(--fs)/1.4 var(--mono)}
-body{display:grid;grid-template-rows:auto auto minmax(0,1fr)}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:var(--fs)/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+body{display:grid;grid-template-rows:auto auto auto minmax(0,1fr)}
 input,button,textarea,select{font:inherit;color:inherit}
 input[type=text],input[type=number],select,textarea.fld{border:1px solid var(--bd);background:var(--inp);padding:2px 4px;min-width:0}
 button{border:1px solid var(--btnbd);background:var(--btn);padding:2px .6em;cursor:pointer}
@@ -1557,30 +1585,142 @@ table.t th,table.t td{border:1px solid var(--gbd);padding:.05em .5em;white-space
 table.t thead th{position:sticky;top:0;background:var(--hd);z-index:1}
 table.t th.i{position:sticky;left:0;background:var(--sub);text-align:left}
 table.t .dt{font-weight:normal;color:var(--dim);font-size:.82em;display:block}
+/* Workspace chrome: all assets and fonts are local. */
+:root{--ed-bg:var(--pn);--ed-text:var(--tx);--ed-gutter:var(--gut);--ed-muted:var(--dim)}
+#brand{display:flex;align-items:center;gap:12px;padding:12px 18px;background:var(--pn);border-bottom:1px solid var(--bd)}
+#brand .logo{display:grid;place-items:center;width:30px;height:30px;border-radius:9px;background:var(--ac-l);color:var(--ac-d);font:bold 14px var(--mono)}
+#brand strong{font-size:15px;letter-spacing:-.4px}#brand .tagline{color:var(--dim);font-size:12px}
+.offline{margin-left:auto;display:flex;align-items:center;gap:7px;color:var(--dim);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+.offline::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--ac)}
+#cfg{background:var(--pn);border-top:0;padding:10px 18px;gap:8px 12px}
+#cfg label{font-size:.84em;color:var(--dim)}#cfg label input{color:var(--tx)}
+#cfg input[type=text]{padding:6px 8px;border-radius:6px}#cfg input[type=checkbox]{accent-color:var(--ac)}
+#ctl{background:var(--pn);padding:9px 18px;gap:6px}
+button{border-radius:6px;padding:5px 10px;background:var(--btn);border-color:var(--bd);font-size:.88em;line-height:1.4}
+button:focus-visible,select:focus-visible,input:focus-visible,textarea.fld:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+button kbd{font:10px var(--mono);opacity:.65;margin-left:6px}
+#ctl .divider{height:20px;width:1px;background:var(--bd);margin:0 5px}
+#brun:not(:disabled){background:var(--ac-d);border-color:var(--ac-d)}
+#status{border-radius:20px;background:var(--sub);padding:4px 10px;font-size:.8em;max-width:30vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ph{padding:9px 12px;background:var(--pn);font-size:10px;letter-spacing:.1em;color:var(--dim);border-bottom-color:var(--gbd)}
+#main{padding:10px;gap:0;grid-template-columns:var(--left) 8px minmax(0,1fr) 8px var(--right)}
+#files,#center,#rt{border:1px solid var(--bd);border-radius:8px;overflow:hidden;background:var(--pn)}
+.split{background:transparent;position:relative}.split::after{content:'';position:absolute;inset:25% 3px;border-radius:3px;background:var(--bd)}
+.split.h::after{inset:3px 40%}.split:hover{background:var(--ac-xl)}
+#center{grid-template-rows:auto minmax(0,1fr) 8px var(--cons)}
+.ti{padding-top:4px;padding-bottom:4px;font-size:.9em}.ti.dir{font-weight:600}.ti .tg{margin-right:4px}
+#tabbar{background:var(--sub);min-height:38px}.tab{padding:9px 14px;font-size:.85em;border-right:0}.tab.on{font-weight:600}
+#edinfo,#toast{font-size:.75em}#toast{max-width:20vw;overflow:hidden;text-overflow:ellipsis}
+#code,.theme-preview{background:var(--ed-bg);color:var(--ed-text);font-family:var(--mono)}
+.gut{background:var(--ed-gutter);color:var(--ed-muted);border-color:var(--gbd)}
+.edta{caret-color:var(--ed-text)}
+#code .line.cur,#code .line.cur .gut{background:var(--ed-mark);color:var(--ed-text)}
+#code .line.caller,#code .line.trail{background:var(--ed-mark)}
+#code .line.exc{background:repeating-linear-gradient(45deg,var(--ed-mark-strong),var(--ed-mark-strong) 4px,var(--ed-mark) 4px,var(--ed-mark) 8px)}
+@keyframes flash{0%{background:var(--ed-mark-strong)}100%{background:var(--ed-mark)}}
+.n{text-decoration:none}.k{font-weight:600}
+#out,#in,.vrow,.frm,table.t{font-family:var(--mono)}
+#prompt{padding:7px 12px;color:var(--dim)}#cons .ph span{display:none}
+#out{padding:10px 12px;line-height:1.55;font-size:.9em}
+.vrow,.frm{padding-top:4px;padding-bottom:4px;font-size:.88em}.sub{padding:6px 10px;letter-spacing:.05em}
+#wadd input{padding:9px 12px;font-size:.85em}#rt .panel+.panel{border-top:1px solid var(--bd)}
+#stackp{max-height:190px}#watchp{max-height:180px}
+#modal{background:rgba(0,0,0,.45);backdrop-filter:blur(3px)}
+#mbox{border:1px solid var(--bd);border-radius:12px;box-shadow:0 20px 80px #0005;max-width:900px}
+#mbox>.ph{padding:12px 18px;color:var(--tx);letter-spacing:0}#mclose{font-size:12px}
+.man{padding:0 24px 24px}.man h2{text-transform:none;letter-spacing:0;font-size:1em;border-bottom:1px solid var(--bd);padding-bottom:10px;margin-top:24px}
+.srow{grid-template-columns:140px 1fr;padding:12px 0}.srow>label{font-weight:500;font-size:.9em}
+.sctl select{padding:5px 8px;border-radius:6px}.sctl input[type=text]{padding:5px 8px;border-radius:6px}
+.theme-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;width:100%}
+.theme-card{display:flex;align-items:center;gap:8px;text-align:left;padding:10px;border:1px solid var(--bd);background:var(--pn)}
+.theme-card[aria-pressed=true]{border-color:var(--ac);box-shadow:0 0 0 1px var(--ac);background:var(--ac-xl)}
+.theme-dots{display:flex;gap:3px}.theme-dots i{display:block;width:10px;height:20px;border-radius:3px}
+.theme-preview{margin:12px 0;padding:16px;border:1px solid var(--bd);border-radius:8px;line-height:1.6;white-space:pre;overflow:auto;font-size:13px}
+.color-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;width:100%}
+.color-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--bd);border-radius:6px;font-size:12px}
+.color-item input{width:26px;height:26px;padding:0;border:0;background:transparent;cursor:pointer}.color-item code{margin-left:auto;color:var(--dim);font-size:11px}
+.style-note{font-size:.85em;color:var(--dim);margin:8px 0}.style-error{color:var(--ac-d);font-size:.85em;min-height:1.4em}
+#tip{border-radius:8px}#winp::placeholder,#in::placeholder{color:var(--dim)}
+[hidden]{display:none !important}
+#center{grid-template-rows:minmax(0,1fr) 8px var(--cons)}
+#editor{display:flex;flex-direction:column;min-height:0;min-width:0;position:relative;overflow:hidden}
+#editor #code{flex:1}
+#edittools,#findbar,#editorstatus{flex:none;border-bottom:1px solid var(--gbd);background:var(--pn)}
+#edittools{display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding:5px 8px}
+#edittools button{font-size:11px;padding:3px 7px}#edittools .hint{margin-left:auto;font-size:11px;color:var(--dim)}
+#findbar{padding:8px 10px;background:var(--sub);font-size:12px}
+.findrow{display:flex;align-items:center;flex-wrap:wrap;gap:6px}.findrow+.findrow{margin-top:7px}
+.findrow input[type=text]{flex:1;min-width:100px;padding:5px 8px;border-radius:5px;font-family:var(--mono)}
+.findrow button{font-size:11px}.findrow label{display:flex;align-items:center;gap:3px;color:var(--dim);font-size:11px}
+#findcount{min-width:65px;color:var(--dim);font-size:11px}#findcount.error{color:var(--ac-d)}
+#editorstatus{display:flex;align-items:center;gap:14px;padding:5px 10px;border-bottom:0;border-top:1px solid var(--gbd);font-size:11px;color:var(--dim)}
+#cursorpos{margin-left:auto}#editorstatus button{padding:0 5px;font-size:11px}
+mark.find-hit{background:var(--ed-mark-strong);color:inherit;outline:1px solid var(--ac-m);border-radius:2px}
+mark.find-hit.current{outline:2px solid var(--ac)}
+#completions{position:absolute;top:76px;left:70px;z-index:5;background:var(--pn);border:1px solid var(--bd);border-radius:8px;box-shadow:0 8px 25px #0003;min-width:230px;max-width:80%;overflow:hidden}
+#completions .label{padding:6px 10px;font-size:10px;color:var(--dim)}
+#completions button{display:block;width:100%;text-align:left;border:0;border-radius:0;font:12px var(--mono);padding:6px 12px}
+#completions button.on{background:var(--ac-l);color:var(--ac-d)}
+@media(max-width:1100px){:root{--left:190px;--right:280px}#cfg label.grow{flex-basis:100%}#ctl button kbd,#brand .tagline{display:none}#ctl .divider{margin:0 2px}}
+@media(max-width:760px){:root{--left:130px;--right:210px}#brand,#cfg,#ctl{padding-left:10px;padding-right:10px}#main{padding:5px}#status{max-width:180px}.theme-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.srow{grid-template-columns:1fr}.color-grid{grid-template-columns:1fr}}
 </style>
-<script>
+<script nonce="__NONCE__">
 const BOOT = __BOOT__;
 const FONTS = {default: 'Consolas,Menlo,"DejaVu Sans Mono",monospace', courier: '"Courier New",Courier,monospace',
   lucida: '"Lucida Console",Monaco,monospace', system: 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
   sans: 'system-ui,"Segoe UI",Arial,sans-serif'};
 const hex2rgb = h => { h = h.replace('#', ''); if (h.length === 3) h = h.split('').map(c => c + c).join(''); const n = parseInt(h, 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
 const mix = (a, b, t) => '#' + a.map((v, i) => Math.round(v * (1 - t) + b[i] * t).toString(16).padStart(2, '0')).join('');
+// Named palettes contain only literal colors. There are no remote stylesheets,
+// font downloads, plugins, or arbitrary CSS in the styling system.
+const THEMES = {
+  light: {label:'Daylight', dark:false, bg:'#eef1f5', panel:'#ffffff', text:'#243047', muted:'#59677c', border:'#d8dee8',
+    code:'#ffffff', ink:'#243047', gutter:'#f6f8fb', tokens:['#7c3aed','#157347','#64748b','#b45309']},
+  dark: {label:'Graphite', dark:true, bg:'#17191e', panel:'#202329', text:'#e1e5ed', muted:'#a0a9b9', border:'#353b46',
+    code:'#202329', ink:'#e1e5ed', gutter:'#242830', tokens:['#c4a0ff','#9bd5a5','#9ba8bc','#f2bd80']},
+  midnight: {label:'Midnight', dark:true, bg:'#0d1424', panel:'#131e33', text:'#dbe7ff', muted:'#9aaed0', border:'#293a58',
+    code:'#101a2d', ink:'#dbe7ff', gutter:'#162238', tokens:['#bba6ff','#7dd3c3','#91a4c4','#ffcb8b']},
+  sepia: {label:'Parchment', dark:false, bg:'#e9e1d2', panel:'#faf4e8', text:'#493c2b', muted:'#78674f', border:'#d5c8af',
+    code:'#faf4e8', ink:'#493c2b', gutter:'#f0e7d6', tokens:['#8055a5','#466b35','#796c57','#9c471f']},
+  forest: {label:'Forest', dark:true, bg:'#101c19', panel:'#182922', text:'#dcebe0', muted:'#a0b9a9', border:'#304a3e',
+    code:'#15251e', ink:'#dcebe0', gutter:'#1a2e25', tokens:['#d4b4ef','#b5d88a','#9db5a5','#f0c492']},
+  contrast: {label:'High contrast', dark:true, bg:'#000000', panel:'#080808', text:'#ffffff', muted:'#c6c6c6', border:'#888888',
+    code:'#000000', ink:'#ffffff', gutter:'#121212', tokens:['#ffff00','#68ffaf','#c6c6c6','#70d7ff']}
+};
+const EDITOR_FIELDS = [['background','Background'],['text','Text'],['keyword','Keywords'],['string','Strings'],['comment','Comments'],['number','Numbers'],['gutter','Gutter']];
+const validColor = v => typeof v === 'string' && /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(v);
+function editorColors(p) {
+  const t = THEMES[p.editor_theme === 'match' ? p.theme : p.editor_theme] || THEMES.light;
+  const c = {background:t.code, text:t.ink, keyword:t.tokens[0], string:t.tokens[1], comment:t.tokens[2], number:t.tokens[3], gutter:t.gutter};
+  for (const [k] of EDITOR_FIELDS) if (validColor((p.editor_colors || {})[k])) c[k] = p.editor_colors[k];
+  return c;
+}
 function applyPrefs(p) {
-  const root = document.documentElement, r = root.style, dark = p.theme === 'dark';
+  const root = document.documentElement, r = root.style, t = THEMES[p.theme] || THEMES.light, dark = t.dark;
   r.setProperty('--fs', p.font_size + 'px');
   r.setProperty('--mono', FONTS[p.font] || FONTS.default);
   r.setProperty('--lh', Math.round(p.font_size * ({compact: 1.3, normal: 1.45, relaxed: 1.7}[p.line] || 1.45)) + 'px');
   root.dataset.theme = dark ? 'dark' : 'light';
-  const a = hex2rgb(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(p.accent) ? p.accent : '#d71e28'), W = [255, 255, 255], bg = dark ? [32, 32, 32] : W;
+  const W = [255,255,255], bg = hex2rgb(t.panel), tint = v => mix(bg, hex2rgb(t.text), v);
+  const vars = {bg:t.bg, pn:t.panel, bd:t.border, tx:t.text, dim:t.muted, hd:tint(.035), hv:tint(.07), gut:t.gutter,
+    gbd:t.border, btn:tint(.035), btnh:tint(.1), btnbd:t.border, inp:t.panel, sub:tint(.035), spl:t.border, cd:tint(.07), sel:tint(.15), off:t.muted};
+  for (const [k,v] of Object.entries(vars)) r.setProperty('--' + k, v);
+  const a = hex2rgb(validColor(p.accent) ? p.accent : '#d71e28');
   r.setProperty('--ac', mix(a, a, 0));
   r.setProperty('--ac-d', dark ? mix(a, W, .4) : mix(a, [0, 0, 0], .3));
   r.setProperty('--ac-m', dark ? mix(a, bg, .5) : mix(a, W, .7));
   r.setProperty('--ac-l', dark ? mix(a, bg, .75) : mix(a, W, .88));
   r.setProperty('--ac-xl', dark ? mix(a, bg, .88) : mix(a, W, .95));
+  const c = editorColors(p);
+  for (const [k,v] of Object.entries({'ed-bg':c.background, 'ed-text':c.text, 'ed-gutter':c.gutter,
+    'ed-muted':c.comment, kw:c.keyword, st:c.string, cm:c.comment, nm:c.number})) r.setProperty('--' + k, v);
+  r.setProperty('--ed-mark', mix(a, hex2rgb(c.background), .88));
+  r.setProperty('--ed-mark-strong', mix(a, hex2rgb(c.background), .7));
   for (const k of ['left', 'right', 'cons']) { if (p.layout && p.layout[k]) r.setProperty('--' + k, p.layout[k] + 'px'); else r.removeProperty('--' + k); }
 }
 applyPrefs(BOOT.prefs);   // before first paint
 </script></head><body>
+<header id="brand"><span class="logo" aria-hidden="true">Py</span><strong>PythonDebugger</strong><span class="tagline">Python debugger &amp; editor</span><span class="offline" title="All assets are embedded. Debugger connections stay on this computer.">Offline · local only</span></header>
 <div id="cfg">
   <label class="grow">Folder <input type="text" id="root" size="20"></label><button id="bopen">Open</button><button id="bbrowse">Browse…</button>
   <label>Script <input type="text" id="script" size="22"></label>
@@ -1590,8 +1730,8 @@ applyPrefs(BOOT.prefs);   // before first paint
   <label><input type="checkbox" id="jmc" checked>just my code</label>
 </div>
 <div id="ctl">
-  <button id="brun">Run</button><button id="bcont" title="F8">Continue</button><button id="bnext" title="F10">Step Over</button>
-  <button id="bstep" title="F11">Step Into</button><button id="bout" title="Shift+F11">Step Out</button>
+  <button id="brun">▶ Run</button><button id="bcont" title="F8">Continue <kbd>F8</kbd></button><span class="divider"></span><button id="bnext" title="F10">Step Over <kbd>F10</kbd></button>
+  <button id="bstep" title="F11">Step Into <kbd>F11</kbd></button><button id="bout" title="Shift+F11">Step Out <kbd>⇧F11</kbd></button><span class="divider"></span>
   <button id="bstop">Stop</button><button id="brestart">Restart</button>
   <span id="status">idle</span><button id="bfm" title="Smaller text only (Ctrl and minus)">A−</button><button id="bfp" title="Larger text only (Ctrl and plus)">A+</button><button id="bset" title="Font size, theme, environment">⚙ Settings</button><button id="bhelp" title="F1">? Help</button>
 </div>
@@ -1599,8 +1739,26 @@ applyPrefs(BOOT.prefs);   // before first paint
   <div class="panel" id="files"><div class="ph">Files</div><div class="pb" id="tree"></div></div>
   <div class="split" data-v="--left" data-d="1"></div>
   <div id="center">
+    <div id="editor">
     <div id="tabbar"><div id="tabs"></div><span id="toast"></span><span id="edinfo"></span><button id="bsave" title="Ctrl+S">Save</button></div>
-    <div id="code"><div class="msg">Open a folder, click a .py file, set breakpoints in the gutter, press Run.</div></div>
+    <div id="edittools" role="toolbar" aria-label="Editor tools">
+      <button id="bundo" title="Undo (Ctrl/Cmd+Z)">Undo</button><button id="bredo" title="Redo (Ctrl/Cmd+Shift+Z)">Redo</button>
+      <button id="bfind" title="Find (Ctrl/Cmd+F)">Find</button><button id="breplace" title="Replace (Ctrl/Cmd+H)">Replace</button>
+      <button id="bgoto" title="Go to line (Ctrl/Cmd+G)">Go to line</button><button id="bcomment" title="Toggle comments (Ctrl/Cmd+/)">Comment</button>
+      <button id="bcomplete" title="Suggest words from this file (Ctrl+Space)">Suggest</button><button id="bsaveall" title="Save all modified files (Ctrl/Cmd+Shift+S)">Save all</button>
+      <span class="hint">Tab to indent · Ctrl/Cmd+/ to comment</span>
+    </div>
+    <div id="findbar" hidden>
+      <div class="findrow"><input id="findtext" type="text" aria-label="Find in current file" placeholder="Find in current file" spellcheck="false">
+        <span id="findcount" role="status" aria-live="polite"></span><button id="findprev" title="Previous match (Shift+Enter)">↑</button><button id="findnext" title="Next match (Enter)">↓</button>
+        <label><input id="findcase" type="checkbox">Match case</label><label><input id="findword" type="checkbox">Whole word</label><label><input id="findregex" type="checkbox">Regex</label>
+        <button id="findclose" aria-label="Close find">×</button></div>
+      <div id="replacerow" class="findrow" hidden><input id="replacetext" type="text" aria-label="Replace with" placeholder="Replace with" spellcheck="false"><button id="replaceone">Replace</button><button id="replaceall">Replace all</button></div>
+    </div>
+    <div id="completions" hidden role="group" aria-label="Local word suggestions"></div>
+    <div id="code"><div class="msg"><h3>Your code, up close.</h3>Open a Python file from the explorer, set a breakpoint in the gutter, then press Run.<br><br>Choose a workspace and editor theme in ⚙ Settings. Everything runs on this computer.</div></div>
+    <div id="editorstatus"><span id="filemode">Python editor</span><span id="fileformat"></span><span id="cursorpos">Ln 1, Col 1</span><button id="bgotofooter" title="Go to line">Go to…</button></div>
+    </div>
     <div class="split h" data-v="--cons" data-d="-1"></div>
     <div id="cons"><div class="ph">Console / terminal <span style="font-weight:normal;text-transform:none"> — when paused, type Python to run in the selected frame (e.g. <b>flag = True</b>); while running, input goes to the script's stdin</span></div>
       <pre id="out"></pre>
@@ -1616,7 +1774,7 @@ applyPrefs(BOOT.prefs);   // before first paint
   </div>
 </div>
 <div id="modal"><div id="mbox"><div class="ph"><span id="mtitle"></span><span class="sp"></span><span id="mctl"></span><button id="mclose">Close</button></div><div id="mbody"></div></div></div>
-<script>
+<script nonce="__NONCE__">
 'use strict';
 const TOKEN = new URLSearchParams(location.search).get('t') || '';
 const $ = (s, r) => (r || document).querySelector(s);
@@ -1637,11 +1795,24 @@ const S = {cfg: {}, prefs: BOOT.prefs, settingsPath: '', state: 'idle', status: 
 /* ---------------- syntax highlighting ---------------- */
 const KW = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield self'.split(' '));
 const RX = /(#[^\n]*)|("{3}[\s\S]*?"{3}|'{3}[\s\S]*?'{3}|(?:[rRbBuUfF]{0,2})"(?:\\.|[^"\\\n])*"|(?:[rRbBuUfF]{0,2})'(?:\\.|[^'\\\n])*')|(\b\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?\b)|(\b[A-Za-z_]\w*\b)/g;
-function highlight(text) {
-  const lines = []; let cur = '';
+function highlight(text, hits = [], selected = -1) {
+  const lines = []; let cur = '', offset = 0, hitIndex = 0;
   const emit = (t, cls) => {
     const parts = t.split('\n');
-    parts.forEach((p, i) => { if (i) { lines.push(cur); cur = ''; } if (p) cur += cls ? '<span class="' + cls + '">' + esc(p) + '</span>' : esc(p); });
+    parts.forEach((p, i) => {
+      if (i) { lines.push(cur); cur = ''; offset++; }
+      let rendered = '', pos = 0;
+      while (pos < p.length) {
+        while (hitIndex < hits.length && hits[hitIndex].end <= offset + pos) hitIndex++;
+        const h = hits[hitIndex], start = offset + pos;
+        const end = h ? Math.min(offset + p.length, h.start > start ? h.start : h.end) : offset + p.length;
+        const chunk = esc(p.slice(pos, end - offset));
+        rendered += h && h.start <= start ? '<mark class="find-hit' + (hitIndex === selected ? ' current' : '') + '">' + chunk + '</mark>' : chunk;
+        pos = end - offset;
+      }
+      if (p) cur += cls ? '<span class="' + cls + '">' + rendered + '</span>' : rendered;
+      offset += p.length;
+    });
   };
   let last = 0, m; RX.lastIndex = 0;
   while ((m = RX.exec(text))) {
@@ -1666,12 +1837,12 @@ async function loadFile(path) {
   let f = S.files.get(key);
   if (!f) {
     f = r.error ? {path: key, error: r.error}
-      : {path: key, text: r.text, saved: r.text, crlf: !!r.crlf, readonly: !!r.readonly, dirty: false, lines: r.text.split('\n'), html: highlight(r.text), scroll: [0, 0]};
+      : {path: key, text: r.text, saved: r.text, crlf: !!r.crlf, readonly: !!r.readonly, dirty: false, lines: r.text.split('\n'), html: highlight(r.text), scroll: [0, 0], selection: [0,0], history: [{text:r.text, selection:[0,0]}], historyIndex:0};
     S.files.set(key, f);
   }
   return f;
 }
-function rememberScroll() { const f = S.files.get(S.active); if (f && !f.error) { const c = $('#code'); f.scroll = [c.scrollTop, c.scrollLeft]; } }
+function rememberScroll() { const f = S.files.get(S.active); if (f && !f.error) { const c = $('#code'), ta = $('#edta'); f.scroll = [c.scrollTop, c.scrollLeft]; if (ta) f.selection = [ta.selectionStart,ta.selectionEnd]; } }
 async function openFile(path, line) {
   const f = await loadFile(path);
   rememberScroll();
@@ -1687,6 +1858,7 @@ function closeTab(p) {
   if (f && f.dirty && !confirm('Discard unsaved changes to ' + base(p) + '?')) return;
   S.tabs.splice(i, 1); S.files.delete(p);  // reopening re-reads the file from disk
   if (S.active === p) S.active = S.tabs[Math.min(i, S.tabs.length - 1)] || null;
+  else rememberScroll();
   renderTabs(); renderCode();
 }
 const base = p => p.split(/[\\/]/).pop();
@@ -1711,6 +1883,14 @@ function updateEdInfo() {
     else if (f.dirty) { i.textContent = 'modified'; i.className = 'mod'; }
   }
   b.disabled = !(f && !f.error && f.dirty && !f.readonly);
+  const writable = f && !f.error && !f.readonly;
+  $('#bundo').disabled = !writable || !f.historyIndex;
+  $('#bredo').disabled = !writable || f.historyIndex >= f.history.length - 1;
+  $('#bcomment').disabled = !writable;
+  $('#bcomplete').disabled = !writable;
+  $('#bsaveall').disabled = ![...S.files.values()].some(g => g.dirty && !g.readonly && !g.error);
+  $('#filemode').textContent = f && !f.error ? (f.readonly ? 'Read-only viewer' : 'Python editor') : 'No file open';
+  $('#fileformat').textContent = f && !f.error ? 'UTF-8 · ' + (f.crlf ? 'CRLF' : 'LF') + ' · 4 spaces' : '';
 }
 let toastTimer = 0;
 function toast(t) { const e = $('#toast'); e.textContent = t; clearTimeout(toastTimer); toastTimer = setTimeout(() => e.textContent = '', 5000); }
@@ -1723,19 +1903,29 @@ function makeRow(n, h) {
 }
 function renderCode() {
   const c = $('#code'); c.textContent = '';
+  hideCompletions();
   const f = S.files.get(S.active);
-  if (!f) { c.appendChild(el('div', 'msg', 'Open a folder, click a .py file, set breakpoints in the gutter, press Run.')); updateEdInfo(); return; }
+  refreshFind();
+  if (!f) { c.appendChild(el('div', 'msg', 'Open a file from the explorer to edit it.')); updateEdInfo(); return; }
   if (f.error) { c.appendChild(el('div', 'msg', f.path + ': ' + f.error)); updateEdInfo(); return; }
+  f.html = highlight(f.text, FIND.hits, FIND.index);
   const root = el('div', 'edroot'); root.id = 'edroot';
   const frag = document.createDocumentFragment();
   f.html.forEach((h, i) => frag.appendChild(makeRow(i + 1, h)));
   root.appendChild(frag);
   const ta = el('textarea', 'edta'); ta.id = 'edta'; ta.value = f.text; ta.spellcheck = false; ta.wrap = 'off'; ta.readOnly = f.readonly;
   ta.setAttribute('autocapitalize', 'off'); ta.setAttribute('autocomplete', 'off');
+  ta.setAttribute('aria-label', 'Code editor: ' + base(f.path)); ta.setAttribute('autocorrect', 'off');
+  ta.addEventListener('beforeinput', e => {
+    if (e.inputType === 'historyUndo' || e.inputType === 'historyRedo') { e.preventDefault(); undoEdit(e.inputType === 'historyRedo'); return; }
+    f.beforeSelection = [ta.selectionStart,ta.selectionEnd];
+  });
   ta.addEventListener('input', onEdInput); ta.addEventListener('keydown', onEdKey);
-  ta.addEventListener('keyup', ev => { if (ev.key.startsWith('Arrow') || ev.key === 'Home' || ev.key === 'End' || ev.key.startsWith('Page')) ensureCaret(ta); });
+  ta.addEventListener('select', () => updateCursor(ta)); ta.addEventListener('click', () => { hideCompletions(); updateCursor(ta); });
+  ta.addEventListener('keyup', () => { updateCursor(ta); ensureCaret(ta); });
   root.appendChild(ta); c.appendChild(root);
-  marks(); updateEdInfo();
+  ta.setSelectionRange(...(f.selection || [0,0]));
+  marks(); updateEdInfo(); updateCursor(ta);
 }
 function syncRows(f) {
   const root = $('#edroot'); if (!root) return;
@@ -1751,11 +1941,15 @@ function syncRows(f) {
 }
 function onEdInput(e) {
   const f = S.files.get(S.active); if (!f) return;
+  const ta = e.target;
+  if (f.readonly) { ta.value = f.text; return; }
   const was = f.dirty;
-  f.text = e.target.value; f.lines = f.text.split('\n'); f.dirty = f.text !== f.saved;
-  if (!S.raf) S.raf = requestAnimationFrame(() => { S.raf = 0; const g = S.files.get(S.active); if (g && !g.error) { g.html = highlight(g.text); syncRows(g); } });
+  recordEdit(f, ta, e.inputType || 'command');
+  f.text = ta.value; f.lines = f.text.split('\n'); f.dirty = f.text !== f.saved;
+  hideCompletions(); refreshFind();
+  if (!S.raf) S.raf = requestAnimationFrame(() => { S.raf = 0; const g = S.files.get(S.active); if (g && !g.error) { g.html = highlight(g.text, FIND.hits, FIND.index); syncRows(g); } });
   if (was !== f.dirty) renderTabs();
-  updateEdInfo(); ensureCaret(e.target);
+  updateEdInfo(); updateCursor(ta); ensureCaret(ta);
 }
 let charW = 0, charFont = '';
 function ensureCaret(ta) {
@@ -1764,28 +1958,285 @@ function ensureCaret(ta) {
   const top = line * lh, bot = top + lh;
   if (top < c.scrollTop) c.scrollTop = top; else if (bot > c.scrollTop + c.clientHeight - 6) c.scrollTop = bot - c.clientHeight + 6;
   if (cs.font !== charFont) { const cv = document.createElement('canvas').getContext('2d'); cv.font = cs.font; charW = cv.measureText('M').width; charFont = cs.font; }
-  const col = p - v.lastIndexOf('\n', p - 1) - 1, x = col * charW + parseFloat(cs.paddingLeft) + ta.offsetLeft;
+  const col = p - lineStartAt(v,p), x = col * charW + parseFloat(cs.paddingLeft) + ta.offsetLeft;
   if (x < c.scrollLeft + ta.offsetLeft + 10) c.scrollLeft = Math.max(0, x - ta.offsetLeft - 10);
   else if (x > c.scrollLeft + c.clientWidth - 30) c.scrollLeft = x - c.clientWidth + 60;
 }
-function onEdKey(e) {
-  const ta = e.target;
-  if (ta.readOnly) return;
-  if (e.key === 'Tab') {
-    e.preventDefault();
-    const v = ta.value, s = ta.selectionStart, en = ta.selectionEnd;
-    if (s === en && !e.shiftKey) { document.execCommand('insertText', false, '    '); return; }
-    const ls = v.lastIndexOf('\n', s - 1) + 1;
-    let le = v.indexOf('\n', en > s && v[en - 1] === '\n' ? en - 1 : en); if (le < 0) le = v.length;
-    const out = v.slice(ls, le).split('\n').map(l => e.shiftKey ? l.replace(/^( {1,4}|\t)/, '') : '    ' + l).join('\n');
-    ta.setSelectionRange(ls, le); document.execCommand('insertText', false, out); ta.setSelectionRange(ls, ls + out.length);
-  } else if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-    e.preventDefault();
-    const v = ta.value, s = ta.selectionStart, ls = v.lastIndexOf('\n', s - 1) + 1, line = v.slice(ls, s);
-    let ind = line.match(/^[ \t]*/)[0]; if (/:\s*(#.*)?$/.test(line)) ind += '    ';
-    document.execCommand('insertText', false, '\n' + ind);
+function lineStartAt(text, pos) { return pos > 0 ? text.lastIndexOf('\n',pos - 1) + 1 : 0; }
+function updateCursor(ta = $('#edta')) {
+  if (!ta) { $('#cursorpos').textContent = ''; return; }
+  const f = S.files.get(S.active), p = ta.selectionStart, end = ta.selectionEnd;
+  if (f) f.selection = [p,end];
+  const line = ta.value.slice(0,p).split('\n').length, col = p - lineStartAt(ta.value,p) + 1;
+  $('#cursorpos').textContent = 'Ln ' + line + ', Col ' + col + (end > p ? ' · ' + (end - p) + ' selected' : '');
+}
+function recordEdit(f, ta, kind) {
+  if (ta.value === f.text) return;
+  const before = f.beforeSelection || f.selection || [0,0], now = Date.now();
+  const current = f.history[f.historyIndex];
+  const group = /^(insertText|deleteContentBackward|deleteContentForward)$/.test(kind) && f.lastEditKind === kind &&
+    now - (f.lastEditAt || 0) < 700 && f.historyIndex > 0 && f.historyIndex === f.history.length - 1 &&
+    before[0] === current.selection[0] && before[1] === current.selection[1];
+  const next = {text:ta.value,selection:[ta.selectionStart,ta.selectionEnd]};
+  if (group) f.history[f.historyIndex] = next;
+  else {
+    current.selection = before.slice(); f.history.splice(f.historyIndex + 1); f.history.push(next); f.historyIndex++;
+    let size = f.history.reduce((n,s) => n + s.text.length,0);
+    while (f.history.length > 2 && (f.history.length > 100 || size > 4000000)) { size -= f.history.shift().text.length; f.historyIndex--; }
+  }
+  f.lastEditKind = kind; f.lastEditAt = now; f.beforeSelection = null;
+}
+function editRange(ta, start, end, text, selection) {
+  if (!ta || ta.readOnly) return;
+  const f = S.files.get(S.active); f.beforeSelection = [ta.selectionStart,ta.selectionEnd];
+  ta.setRangeText(text,start,end,'end');
+  if (selection) ta.setSelectionRange(...selection);
+  ta.focus(); onEdInput({target:ta,inputType:'command'});
+}
+function undoEdit(redo = false) {
+  const f = S.files.get(S.active), ta = $('#edta');
+  if (!f || !ta || f.readonly) return;
+  const index = f.historyIndex + (redo ? 1 : -1);
+  if (index < 0 || index >= f.history.length) return;
+  f.history[f.historyIndex].selection = [ta.selectionStart,ta.selectionEnd];
+  f.historyIndex = index; const snap = f.history[index];
+  f.text = ta.value = snap.text; f.lines = f.text.split('\n'); f.dirty = f.text !== f.saved; f.lastEditKind = ''; f.beforeSelection = null;
+  ta.setSelectionRange(...snap.selection); hideCompletions(); refreshFind();
+  f.html = highlight(f.text,FIND.hits,FIND.index); syncRows(f); renderTabs(); updateEdInfo(); updateCursor(ta); ta.focus(); ensureCaret(ta);
+}
+function lineRange(ta) {
+  const v = ta.value, s = ta.selectionStart, e = ta.selectionEnd;
+  const start = lineStartAt(v,s);
+  let end = v.indexOf('\n',e > s && v[e - 1] === '\n' ? e - 1 : e);
+  if (end < 0) end = v.length;
+  return {start,end,text:v.slice(start,end)};
+}
+function indentLines(outdent = false) {
+  const ta = $('#edta'); if (!ta || ta.readOnly) return;
+  if (ta.selectionStart === ta.selectionEnd && !outdent) {
+    const col = ta.selectionStart - lineStartAt(ta.value,ta.selectionStart);
+    editRange(ta,ta.selectionStart,ta.selectionEnd,' '.repeat(4 - col % 4)); return;
+  }
+  const r = lineRange(ta), rows = r.text.split('\n'), changes = rows.map(l => outdent ? -(l.match(/^( {1,4}|\t)/) || [''])[0].length : 4);
+  const text = rows.map((l,i) => outdent ? l.slice(-changes[i]) : '    ' + l).join('\n');
+  const s = ta.selectionStart, e = ta.selectionEnd;
+  const start = Math.max(r.start,s + changes[0]);
+  const end = e === s ? start : Math.max(start,e + changes.reduce((a,b) => a + b,0));
+  editRange(ta,r.start,r.end,text,[start,end]);
+}
+function toggleComments() {
+  const ta = $('#edta'); if (!ta || ta.readOnly) return;
+  const r = lineRange(ta), rows = r.text.split('\n'), nonblank = rows.filter(l => l.trim());
+  const remove = nonblank.length && nonblank.every(l => /^\s*#/.test(l));
+  const indent = nonblank.length ? Math.min(...nonblank.map(l => l.match(/^[ \t]*/)[0].length)) : 0;
+  const text = rows.map(l => remove ? l.replace(/^(\s*)# ?/,'$1') : l.trim() || rows.length === 1 ? l.slice(0,indent) + '# ' + l.slice(indent) : l).join('\n');
+  editRange(ta,r.start,r.end,text,[r.start,r.start + text.length]);
+}
+function duplicateLines() {
+  const ta = $('#edta'); if (!ta || ta.readOnly) return;
+  const r = lineRange(ta), s = ta.selectionStart, e = ta.selectionEnd, offset = r.text.length + 1;
+  editRange(ta,r.end,r.end,'\n' + r.text,[s + offset,e + offset]);
+}
+function moveLines(down) {
+  const ta = $('#edta'); if (!ta || ta.readOnly) return;
+  const r = lineRange(ta), s = ta.selectionStart, e = ta.selectionEnd;
+  if (down) {
+    if (r.end === ta.value.length) return;
+    let end = ta.value.indexOf('\n',r.end + 1); if (end < 0) end = ta.value.length;
+    const next = ta.value.slice(r.end + 1,end), delta = next.length + 1;
+    editRange(ta,r.start,end,next + '\n' + r.text,[s + delta,e + delta]);
+  } else {
+    if (!r.start) return;
+    const start = lineStartAt(ta.value,r.start - 1), prev = ta.value.slice(start,r.start - 1), delta = prev.length + 1;
+    editRange(ta,start,r.end,r.text + '\n' + prev,[s - delta,e - delta]);
   }
 }
+function pythonContext(text, end) {
+  let quote = '', triple = false, comment = false;
+  for (let i = 0; i < end; i++) {
+    const c = text[i];
+    if (comment) { if (c === '\n') comment = false; continue; }
+    if (quote) {
+      if (c === '\\') { i++; continue; }
+      if (triple) { if (text.slice(i,i + 3) === quote.repeat(3) && i + 3 <= end) { quote = ''; triple = false; i += 2; } }
+      else if (c === quote || c === '\n') quote = '';
+    } else if (c === '#') comment = true;
+    else if (c === '"' || c === "'") {
+      quote = c; triple = text.slice(i,i + 3) === c.repeat(3) && i + 3 <= end; if (triple) i += 2;
+    }
+  }
+  return {quote,comment};
+}
+function onEdKey(e) {
+  const ta = e.target, mod = e.ctrlKey || e.metaKey;
+  if (e.isComposing) return;
+  if (COMPLETE.items.length && ['ArrowDown','ArrowUp','Enter','Tab','Escape'].includes(e.key)) {
+    e.preventDefault(); e.stopPropagation();
+    if (e.key === 'Escape') hideCompletions();
+    else if (e.key === 'Enter' || e.key === 'Tab') acceptCompletion();
+    else { COMPLETE.index = (COMPLETE.index + (e.key === 'ArrowDown' ? 1 : -1) + COMPLETE.items.length) % COMPLETE.items.length; renderCompletions(); }
+    return;
+  }
+  if (COMPLETE.items.length) hideCompletions();
+  if (mod && ['z','y'].includes(e.key.toLowerCase())) { e.preventDefault(); undoEdit(e.shiftKey || e.key.toLowerCase() === 'y'); return; }
+  if (ta.readOnly) return;
+  if (mod && e.code === 'Space') { e.preventDefault(); suggestWords(); return; }
+  if (mod && e.key === '/') { e.preventDefault(); toggleComments(); return; }
+  if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) { e.preventDefault(); e.shiftKey ? duplicateLines() : moveLines(e.key === 'ArrowDown'); return; }
+  if (e.key === 'Tab') { e.preventDefault(); indentLines(e.shiftKey); return; }
+  if (mod || e.altKey) return;
+  const v = ta.value, s = ta.selectionStart, end = ta.selectionEnd;
+  const pairs = {'(':')','[':']','{':'}','"':'"',"'":"'"};
+  const context = pythonContext(v,s);
+  if (e.key === 'Backspace' && s > 0 && s === end && pairs[v[s - 1]] === v[s] && !context.comment && (!context.quote || context.quote === v[s - 1])) {
+    e.preventDefault(); editRange(ta,s - 1,s + 1,''); return;
+  }
+  if (!context.quote && !context.comment && s === end && ')]}'.includes(e.key) && v[s] === e.key) { e.preventDefault(); ta.setSelectionRange(s + 1,s + 1); updateCursor(ta); return; }
+  if (Object.prototype.hasOwnProperty.call(pairs,e.key)) {
+    // Pair only outside strings/comments; triple quotes remain ordinary input.
+    const quote = e.key === '"' || e.key === "'";
+    if (quote && context.quote === e.key && !context.comment && s === end && v[s] === e.key) { e.preventDefault(); ta.setSelectionRange(s + 1,s + 1); updateCursor(ta); return; }
+    if (!context.quote && !context.comment && (!quote || !/[\w'"\\]/.test(v[s - 1] || '')) && (s !== end || !/[\w]/.test(v[end] || ''))) {
+      e.preventDefault(); const text = e.key + v.slice(s,end) + pairs[e.key];
+      editRange(ta,s,end,text,[s + 1,end + 1]); return;
+    }
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const line = v.slice(lineStartAt(v,s),s), baseIndent = line.match(/^[ \t]*/)[0];
+    let indent = baseIndent; if (!context.quote && (/^[^#]*:\s*(#.*)?$/.test(line) || (!context.comment && /[([{]\s*$/.test(line)))) indent += '    ';
+    const splitPair = !context.quote && !context.comment && s === end && ['()', '[]', '{}'].includes(v.slice(s - 1,s + 1));
+    const text = '\n' + indent + (splitPair ? '\n' + baseIndent : '');
+    editRange(ta,s,end,text,[s + 1 + indent.length,s + 1 + indent.length]);
+  }
+}
+
+/* ---------------- find / replace and local word suggestions ---------------- */
+const FIND = {open:false,hits:[],index:-1,error:'',limit:false};
+const COMPLETE = {items:[],index:0,start:0,end:0};
+function findPattern() {
+  let query = $('#findtext').value; if (!query) return null;
+  if (!$('#findregex').checked) query = query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  if ($('#findword').checked) query = '\\b(?:' + query + ')\\b';
+  return new RegExp(query,'gm' + ($('#findcase').checked ? '' : 'i'));
+}
+function refreshFind() {
+  FIND.hits = []; FIND.error = ''; FIND.limit = false;
+  const f = S.files.get(S.active), ta = $('#edta');
+  if (FIND.open && f && !f.error) {
+    try {
+      const re = findPattern(); let m;
+      if (re) while ((m = re.exec(f.text))) {
+        if (!m[0].length) { re.lastIndex = m.index + 1; continue; }
+        if (FIND.hits.length === 5000) { FIND.limit = true; break; }
+        FIND.hits.push({start:m.index,end:m.index + m[0].length});
+      }
+    } catch (e) { FIND.error = 'Invalid regex'; }
+  }
+  const caret = ta && ta.value === (f || {}).text ? ta.selectionStart : f && f.selection ? f.selection[0] : 0;
+  FIND.index = FIND.hits.findIndex(h => h.start >= caret); if (FIND.index < 0 && FIND.hits.length) FIND.index = 0;
+  updateFindCount();
+}
+function updateFindCount() {
+  const count = $('#findcount'); count.className = FIND.error ? 'error' : '';
+  count.textContent = FIND.error || (FIND.hits.length ? (FIND.index + 1) + ' / ' + FIND.hits.length + (FIND.limit ? '+' : '') : 'No matches');
+  const f = S.files.get(S.active), writable = f && !f.error && !f.readonly;
+  $('#findprev').disabled = $('#findnext').disabled = !FIND.hits.length;
+  $('#replaceone').disabled = $('#replaceall').disabled = !writable || !FIND.hits.length;
+}
+function paintSearch() {
+  const f = S.files.get(S.active); if (f && !f.error) { f.html = highlight(f.text,FIND.hits,FIND.index); syncRows(f); }
+}
+function openFind(replace = false) {
+  hideCompletions();
+  FIND.open = true; $('#findbar').hidden = false; $('#replacerow').hidden = !replace;
+  const ta = $('#edta'); if (ta && ta.selectionEnd > ta.selectionStart) {
+    const selected = ta.value.slice(ta.selectionStart,ta.selectionEnd); if (!selected.includes('\n')) $('#findtext').value = selected;
+  }
+  refreshFind(); paintSearch(); $('#findtext').focus(); $('#findtext').select();
+}
+function closeFind() { FIND.open = false; $('#findbar').hidden = true; refreshFind(); paintSearch(); const ta = $('#edta'); if (ta) ta.focus(); }
+function nextMatch(backward = false, fromInput = false) {
+  if (!FIND.hits.length) return;
+  const ta = $('#edta'), current = FIND.hits[FIND.index];
+  const selected = ta && current && ta.selectionStart === current.start && ta.selectionEnd === current.end;
+  if (selected) FIND.index = (FIND.index + (backward ? -1 : 1) + FIND.hits.length) % FIND.hits.length;
+  else {
+    FIND.index = FIND.hits.findIndex(h => h.start >= ta.selectionStart); if (FIND.index < 0) FIND.index = 0;
+    if (backward) FIND.index = (FIND.index - 1 + FIND.hits.length) % FIND.hits.length;
+  }
+  const h = FIND.hits[FIND.index]; ta.setSelectionRange(h.start,h.end); if (!fromInput) ta.focus();
+  updateCursor(ta); ensureCaret(ta); updateFindCount(); paintSearch();
+}
+function replaceMatches(all) {
+  const ta = $('#edta'), f = S.files.get(S.active); if (!ta || !f || f.readonly || !FIND.hits.length || FIND.error) return;
+  const re = findPattern(), replacement = $('#replacetext').value;
+  if (all) {
+    const text = replaceNonempty(f.text,re,replacement,!$('#findregex').checked);
+    editRange(ta,0,f.text.length,text,[0,0]);
+  } else {
+    const h = FIND.hits[FIND.index];
+    const one = new RegExp(re.source,re.flags.replace('g','') + 'y'); one.lastIndex = h.start;
+    const result = f.text.replace(one,$('#findregex').checked ? replacement : () => replacement);
+    const inserted = result.slice(h.start,result.length - (f.text.length - h.end));
+    editRange(ta,h.start,h.end,inserted);
+  }
+  refreshFind(); paintSearch();
+}
+function replaceNonempty(text, re, replacement, literal) {
+  const parts = []; let m, last = 0;
+  while ((m = re.exec(text))) {
+    if (!m[0].length) { re.lastIndex = m.index + 1; continue; }
+    const inserted = literal ? replacement : replacement.replace(/\$(\$|&|`|'|<[^>]*>|\d{1,2})/g,(token,k) => {
+      if (k === '$') return '$'; if (k === '&') return m[0];
+      if (k === '`') return text.slice(0,m.index); if (k === "'") return text.slice(m.index + m[0].length);
+      if (k[0] === '<') return m.groups ? (m.groups[k.slice(1,-1)] || '') : token;
+      if (+k > 0 && +k < m.length) return m[+k] || '';
+      if (k.length === 2 && +k[0] > 0 && +k[0] < m.length) return (m[+k[0]] || '') + k[1];
+      return token;
+    });
+    parts.push(text.slice(last,m.index),inserted); last = m.index + m[0].length;
+  }
+  parts.push(text.slice(last)); return parts.join('');
+}
+function goToLine() {
+  const ta = $('#edta'); if (!ta) return;
+  hideCompletions();
+  const answer = prompt('Go to line (or line:column)',String(ta.value.slice(0,ta.selectionStart).split('\n').length));
+  if (answer === null) return;
+  const m = /^\s*(\d+)(?::(\d+))?\s*$/.exec(answer);
+  if (!m || +m[1] < 1 || (m[2] && +m[2] < 1)) { toast('Enter a line number, such as 12 or 12:4'); return; }
+  const lines = ta.value.split('\n'), line = Math.min(+m[1],lines.length) - 1;
+  const pos = lines.slice(0,line).reduce((n,l) => n + l.length + 1,0) + Math.min((+(m[2] || 1)) - 1,lines[line].length);
+  ta.setSelectionRange(pos,pos); ta.focus(); updateCursor(ta); ensureCaret(ta);
+}
+function hideCompletions() { COMPLETE.items = []; $('#completions').hidden = true; }
+function suggestWords() {
+  const ta = $('#edta'); if (!ta || ta.readOnly) return;
+  const match = /[A-Za-z_]\w*$/.exec(ta.value.slice(0,ta.selectionStart));
+  if (!match) { toast('Type the start of a name, then press Ctrl+Space'); return; }
+  const prefix = match[0], words = new Set([...KW,...(ta.value.match(/\b[A-Za-z_]\w*\b/g) || []),...'print len range enumerate zip sorted sum min max open str int float list dict set tuple isinstance super'.split(' ')]);
+  COMPLETE.items = [...words].filter(w => w !== prefix && w.startsWith(prefix)).sort().slice(0,8);
+  COMPLETE.start = ta.selectionStart - prefix.length; COMPLETE.end = ta.selectionStart; COMPLETE.index = 0;
+  if (!COMPLETE.items.length) { hideCompletions(); toast('No local word suggestions'); return; }
+  ta.focus(); renderCompletions();
+}
+function renderCompletions() {
+  const host = $('#completions'); host.textContent = ''; host.hidden = false;
+  host.appendChild(el('div','label','Words in this file + Python keywords · ↑↓ Enter · Esc'));
+  COMPLETE.items.forEach((word,i) => { const b = el('button',i === COMPLETE.index ? 'on' : '',word); b.onmousedown = e => e.preventDefault(); b.onclick = () => { COMPLETE.index = i; acceptCompletion(); }; host.appendChild(b); });
+}
+function acceptCompletion() {
+  const ta = $('#edta'), word = COMPLETE.items[COMPLETE.index]; if (!ta || !word) return;
+  editRange(ta,COMPLETE.start,COMPLETE.end,word); hideCompletions();
+}
+$('#bundo').onclick = () => undoEdit(); $('#bredo').onclick = () => undoEdit(true);
+$('#bfind').onclick = () => openFind(); $('#breplace').onclick = () => openFind(true);
+$('#bgoto').onclick = $('#bgotofooter').onclick = goToLine; $('#bcomment').onclick = toggleComments; $('#bcomplete').onclick = suggestWords;
+$('#findclose').onclick = closeFind; $('#findprev').onclick = () => nextMatch(true); $('#findnext').onclick = () => nextMatch();
+$('#replaceone').onclick = () => replaceMatches(false); $('#replaceall').onclick = () => replaceMatches(true);
+['findtext','findcase','findword','findregex'].forEach(id => $('#' + id).addEventListener('input',() => { refreshFind(); paintSearch(); }));
+$('#findtext').addEventListener('keydown',e => { if (e.key === 'Enter') { e.preventDefault(); nextMatch(e.shiftKey,true); } });
 function shiftBreaks(path, oldT, newT) {
   const s = S.breaks.get(path); if (!s || !s.size) return false;
   const a = oldT.split('\n'), b = newT.split('\n'); let p = 0;
@@ -1798,13 +2249,24 @@ function shiftBreaks(path, oldT, newT) {
 }
 async function saveFile(f) {
   if (!f || f.error || f.readonly || !f.dirty) return;
-  const r = await post('save', {path: f.path, text: f.text, crlf: f.crlf});
+  if (f.saving) { try { await f.saving; } catch (e) { return false; } return saveFile(f); }
+  // An edit made while the HTTP request is in flight must stay marked dirty.
+  const text = f.text, previous = f.saved;
+  f.saving = post('save', {path: f.path, text, crlf: f.crlf});
+  let r;
+  try { r = await f.saving; } catch (e) { toast('Save failed: ' + e.message); return false; }
+  finally { f.saving = null; }
   if (r.error) { toast('Save failed: ' + r.error); return; }
-  if (shiftBreaks(f.path, f.saved, f.text)) syncBreaks();
-  f.saved = f.text; f.dirty = false; renderTabs(); updateEdInfo(); marks();
-  toast(S.state === 'idle' ? 'Saved' : 'Saved — Restart to run the new code');
+  if (shiftBreaks(f.path, previous, text)) syncBreaks();
+  f.saved = text; f.dirty = f.text !== text; renderTabs(); updateEdInfo(); marks();
+  toast(f.dirty ? 'Saved snapshot — newer edits are still unsaved' : S.state === 'idle' ? 'Saved' : 'Saved — Restart to run the new code');
+  return true;
 }
 $('#bsave').onclick = () => saveFile(S.files.get(S.active));
+async function saveAll() {
+  for (const f of S.files.values()) if (f.dirty && !f.readonly && !f.error) await saveFile(f);
+}
+$('#bsaveall').onclick = saveAll;
 function marks(flash) {
   const c = $('#code');
   c.querySelectorAll('.cur,.caller,.exc,.bp,.trail,.flash').forEach(e => e.classList.remove('cur', 'caller', 'exc', 'bp', 'trail', 'flash'));
@@ -1914,11 +2376,19 @@ const MANUAL = `<div class="man">
 <ul>
 <li>The editor is always editable: click in the code and type. A <b>●</b> on the tab and the word <i>modified</i> show unsaved changes.</li>
 <li><kbd>Ctrl</kbd>+<kbd>S</kbd> (or the Save button) writes the file to disk. Line endings (LF / CRLF) are preserved.</li>
-<li><kbd>Tab</kbd> inserts 4 spaces; with several lines selected it indents them; <kbd>Shift</kbd>+<kbd>Tab</kbd> un-indents. <kbd>Enter</kbd> keeps the indentation and adds 4 more after a line ending in <code>:</code>. <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> undo and redo; copy, paste and select-all work as usual.</li>
+<li><b>Save all</b> or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> writes all modified, writable tabs. Typing while a save is in progress keeps the newer edits marked as unsaved.</li>
+<li><kbd>Tab</kbd> advances to the next 4-space indent stop; with several lines selected it indents them; <kbd>Shift</kbd>+<kbd>Tab</kbd> un-indents. <kbd>Enter</kbd> keeps indentation and adds 4 spaces after a block colon or opening bracket. Between a bracket pair it creates an indented blank line.</li>
+<li><b>Undo / Redo:</b> <kbd>Ctrl</kbd>+<kbd>Z</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> or <kbd>Ctrl</kbd>+<kbd>Y</kbd>. Each tab retains its own in-memory history and cursor position. History survives saving and tab switches, but not closing the tab or reloading the page.</li>
+<li><b>Find / Replace:</b> <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>H</kbd>. Search the current file with match-case, whole-word, or JavaScript regex options. <kbd>Enter</kbd> / <kbd>Shift</kbd>+<kbd>Enter</kbd> navigate matches while the find field is focused; <kbd>F3</kbd> / <kbd>Shift</kbd>+<kbd>F3</kbd> navigate from the editor. <kbd>Esc</kbd> closes find. Regex replacements support capture groups such as <code>$1</code>; literal replacements keep dollar signs unchanged. Zero-width matches are skipped. Highlighting is limited to 5,000 matches; Replace all processes every nonempty match in the file as one undoable edit.</li>
+<li><b>Go to line:</b> <kbd>Ctrl</kbd>+<kbd>G</kbd>; enter <code>12</code> or <code>12:4</code> for a column. The status bar shows the current line, column, selection size, and line endings.</li>
+<li><b>Line commands:</b> <kbd>Ctrl</kbd>+<kbd>/</kbd> toggles comments on the current or selected lines. <kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> moves lines. <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↓</kbd> duplicates them.</li>
+<li><b>Pairs:</b> brackets and quotes close automatically outside strings/comments; selected text can be wrapped in a pair. Backspace between an empty pair removes both characters.</li>
+<li><b>Suggest:</b> type the start of a name and press <kbd>Ctrl</kbd>+<kbd>Space</kbd>, or use the Suggest button. Candidates come from this file, Python keywords, and common built-ins. Choose with <kbd>↑</kbd> / <kbd>↓</kbd>, accept with <kbd>Enter</kbd> / <kbd>Tab</kbd>, dismiss with <kbd>Esc</kbd>. This is word completion, without type analysis or external packages.</li>
+<li>On Mac, use <kbd>Cmd</kbd> for Ctrl-based commands except <kbd>Ctrl</kbd>+<kbd>Space</kbd>. Normal copy, cut, paste and select-all work in the editor.</li>
 <li><b>A running program is not changed by edits.</b> Save, then press <b>Restart</b> to run the new code. While you are paused, the marker lines refer to the code as it was when the program started.</li>
 <li>When you save, breakpoints below your edit move with the code (if you inserted or deleted lines above them); breakpoints on lines you deleted are dropped.</li>
 <li>Files outside the project folder (libraries you stepped into) and files that are not valid UTF-8 open <b>read-only</b>.</li>
-<li>Not included: autocomplete, search/replace, multi-cursor, code folding. Use your normal editor for heavy refactoring.</li>
+<li>Not included: semantic autocomplete, multi-cursor, code folding, or project-wide refactoring.</li>
 </ul>
 
 <h2>Settings row</h2>
@@ -1935,7 +2405,9 @@ const MANUAL = `<div class="man">
 <ul>
 <li><b>Text-only zoom</b>: the <b>A−</b> / <b>A+</b> buttons in the toolbar, <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>Ctrl</kbd>+<kbd>−</kbd> (<kbd>Cmd</kbd> on Mac), <kbd>Ctrl</kbd>+scroll wheel, and <kbd>Ctrl</kbd>+<kbd>0</kbd> to reset. They change <i>only the size of the text</i> (code, panels, tables, console); panel sizes stay as you set them, unlike the browser's own zoom (its menu still works as usual and scales everything).</li>
 <li><b>Font size</b> (also settable here by number), <b>font family</b>, <b>line spacing</b>.</li>
-<li><b>Theme</b>: Light or Dark. <b>Accent color</b>: pick a swatch, the color box, or type a hex value like <code>#d71e28</code>; shades for highlights are derived from it.</li>
+<li><b>Workspace theme</b>: Daylight, Graphite, Midnight, Parchment, Forest, or High contrast. <b>Viewer / editor</b> can match the workspace or use a different preset. The live code preview shows your selection.</li>
+<li><b>Custom colors</b>: adjust editor background, text, keywords, strings, comments, numbers, and gutter. <b>Reset editor colors</b> clears overrides; choosing an editor preset also clears them. <b>Accent color</b> controls buttons, breakpoints, and execution highlights.</li>
+<li><b>Style files</b>: export appearance to a local JSON file, then import it on another machine. Styles contain only validated appearance settings, never code, environment variables, or project paths. No CSS, JavaScript, fonts, images, or stylesheets are downloaded.</li>
 <li><b>Environment variables</b>: your script always inherits the environment of the terminal that started this tool. In addition you can add <code>KEY=VALUE</code> lines here (one per line, <code>#</code> for comments, <code>$OTHER</code>/<code>%OTHER%</code> are expanded), and tick <i>load .env from the project folder</i>. Order of precedence: this list overrides <code>.env</code>, which overrides the inherited environment.</li>
 <li>Everything is saved automatically to <code>debugger_settings.json</code> next to <code>debugger.py</code> (or in your home folder if that folder is not writable) and loaded on the next start, so the page opens already themed. It also remembers the last folder, script, arguments, breakpoints and watches. <b>Do not put secrets in it</b>: it is a plain text file. Export secrets in your shell instead.</li>
 <li><b>Reset to defaults</b> restores the look; delete the file to forget everything.</li>
@@ -2036,13 +2508,76 @@ function setPref(k, v) { S.prefs[k] = v; applyPrefs(S.prefs); savePrefsSoon(); i
 let cfgTimer = 0;
 function pushCfgSoon() { clearTimeout(cfgTimer); cfgTimer = setTimeout(pushCfg, 300); }
 const ACCENTS = [['Red', '#d71e28'], ['Blue', '#1f6feb'], ['Green', '#1a7f37'], ['Orange', '#c8610a'], ['Purple', '#8250df'], ['Gray', '#555555']];
+const STYLE_KEYS = ['font_size','font','line','theme','accent','editor_theme','editor_colors'];
+function readStyle(data) {
+  if (!data || data.format !== 'pythondebugger-style' || data.version !== 1 || !data.prefs || typeof data.prefs !== 'object' || Array.isArray(data.prefs))
+    throw new Error('Choose a PythonDebugger style JSON file (version 1).');
+  const p = data.prefs, out = {};
+  for (const k of Object.keys(p)) {
+    if (!STYLE_KEYS.includes(k)) throw new Error('Unknown style setting: ' + k);
+    const v = p[k];
+    if ((k === 'font_size' && (!Number.isInteger(v) || v < 9 || v > 32)) ||
+        (k === 'font' && !Object.prototype.hasOwnProperty.call(FONTS,v)) ||
+        (k === 'line' && !['compact','normal','relaxed'].includes(v)) ||
+        (k === 'theme' && !Object.prototype.hasOwnProperty.call(THEMES,v)) ||
+        (k === 'editor_theme' && v !== 'match' && !Object.prototype.hasOwnProperty.call(THEMES,v)) ||
+        (k === 'accent' && !validColor(v))) throw new Error('Invalid style setting: ' + k);
+    if (k === 'editor_colors') {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('Editor colors must be an object.');
+      for (const [name,color] of Object.entries(v)) if (!EDITOR_FIELDS.some(([f]) => f === name) || !validColor(color))
+        throw new Error('Invalid editor color: ' + name);
+    }
+    out[k] = v;
+  }
+  if (!Object.keys(out).length) throw new Error('The style has no appearance settings.');
+  return out;
+}
+function exportStyle() {
+  const prefs = {}; STYLE_KEYS.forEach(k => prefs[k] = S.prefs[k]);
+  const blob = new Blob([JSON.stringify({format:'pythondebugger-style',version:1,prefs}, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob), a = el('a'); a.href = url; a.download = 'pythondebugger-style.json';
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 function showSettings() {
   showModal('Settings');
   const b = $('#mbody'), keep = b.scrollTop; b.textContent = '';
   const w = el('div', 'man'); b.appendChild(w);
   const P = S.prefs;
-  const row = (label, ...ctl) => { const r = el('div', 'srow'); r.appendChild(el('label', null, label)); const c = el('div', 'sctl'); ctl.forEach(x => c.appendChild(x)); r.appendChild(c); w.appendChild(r); return c; };
+  let rowId = 0;
+  const row = (label, ...ctl) => { const r = el('div', 'srow'), l = el('label', null, label); r.appendChild(l); const c = el('div', 'sctl'); ctl.forEach(x => c.appendChild(x)); r.appendChild(c); w.appendChild(r);
+    const field = c.querySelector('select,input:not([type=color]),textarea'); if (field) { field.id = 'setting-' + rowId++; l.htmlFor = field.id; }
+    else { c.setAttribute('role','group'); c.setAttribute('aria-label',label); } return c; };
   w.appendChild(el('h2', null, 'Appearance'));
+  w.appendChild(el('p', 'style-note', 'Built-in styles, local fonts, and a live preview. No downloads or internet connection.'));
+  const cards = el('div', 'theme-grid');
+  Object.entries(THEMES).forEach(([key,t]) => {
+    const card = el('button','theme-card'); card.setAttribute('aria-pressed', String(P.theme === key));
+    const dots = el('span','theme-dots'); dots.setAttribute('aria-hidden','true');
+    [t.bg,t.text,t.tokens[0]].forEach(color => { const dot = el('i'); dot.style.background = color; dots.appendChild(dot); });
+    card.appendChild(dots); card.appendChild(el('span',null,t.label)); card.onclick = () => setPref('theme',key); cards.appendChild(card);
+  });
+  row('Workspace theme',cards);
+  const editorTheme = el('select');
+  [['match','Match workspace'], ...Object.entries(THEMES).map(([k,t]) => [k,t.label])].forEach(([key,label]) => {
+    const o = el('option',null,label); o.value = key; o.selected = (P.editor_theme || 'match') === key; editorTheme.appendChild(o);
+  });
+  editorTheme.onchange = () => { S.prefs.editor_colors = {}; setPref('editor_theme',editorTheme.value); };
+  row('Viewer / editor',editorTheme);
+  const preview = el('pre','theme-preview'); preview.setAttribute('aria-label','Editor theme preview');
+  preview.innerHTML = '<span class="c"># A preview of your Python style</span>\n<span class="k">def</span> greet(name):\n    message = <span class="s">"Hello, "</span> + name\n    <span class="k">return</span> message, <span class="n">42</span>';
+  w.appendChild(preview);
+  const colors = el('div','color-grid'), current = editorColors(P);
+  EDITOR_FIELDS.forEach(([key,label]) => {
+    const item = el('label','color-item'), input = el('input'), hex = el('code',null,current[key]);
+    input.type = 'color'; input.setAttribute('aria-label','Editor ' + label.toLowerCase());
+    input.value = mix(hex2rgb(current[key]),hex2rgb(current[key]),0);
+    input.oninput = () => { S.prefs.editor_colors = Object.assign({}, S.prefs.editor_colors, {[key]:input.value}); hex.textContent = input.value; applyPrefs(S.prefs); savePrefsSoon(); };
+    item.appendChild(input); item.appendChild(el('span',null,label)); item.appendChild(hex); colors.appendChild(item);
+  });
+  row('Custom colors',colors);
+  const clearColors = el('button',null,'Reset editor colors'); clearColors.onclick = () => setPref('editor_colors',{});
+  row('Color overrides',clearColors);
+  w.appendChild(el('p','style-note','Color overrides apply to the viewer and editor. Choosing an editor preset clears overrides. Workspace and editor themes can be different.'));
   const fs = el('input'); fs.type = 'number'; fs.min = 9; fs.max = 32; fs.value = P.font_size;
   const setFs = v => setPref('font_size', Math.max(9, Math.min(32, Math.round(+v) || 14)));
   const dec = el('button', null, 'A−'), inc = el('button', null, 'A+');
@@ -2054,12 +2589,26 @@ function showSettings() {
   const ls = el('select'); [['compact', 'Compact'], ['normal', 'Normal'], ['relaxed', 'Relaxed']]
     .forEach(([k, n]) => { const o = el('option', null, n); o.value = k; if (P.line === k) o.selected = true; ls.appendChild(o); });
   ls.onchange = () => setPref('line', ls.value); row('Line spacing', ls);
-  const tl = el('button', 'tgl' + (P.theme === 'light' ? ' on' : ''), 'Light'), td = el('button', 'tgl' + (P.theme === 'dark' ? ' on' : ''), 'Dark');
-  tl.onclick = () => setPref('theme', 'light'); td.onclick = () => setPref('theme', 'dark'); row('Theme', tl, td);
   const sw = ACCENTS.map(([n, h]) => { const x = el('button', 'sw2' + (P.accent.toLowerCase() === h ? ' on' : '')); x.style.background = h; x.title = n; x.onclick = () => setPref('accent', h); return x; });
   const col = el('input'); col.type = 'color'; col.value = P.accent.length === 7 ? P.accent : '#d71e28'; col.onchange = () => setPref('accent', col.value);
   const hx = el('input'); hx.type = 'text'; hx.size = 8; hx.value = P.accent; hx.onchange = () => { if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(hx.value.trim())) setPref('accent', hx.value.trim()); else hx.value = P.accent; };
   row('Accent color', ...sw, col, hx);
+  const saveStyle = el('button',null,'Export style…'); saveStyle.onclick = exportStyle;
+  const loadStyle = el('button',null,'Import style…'), file = el('input'); file.type = 'file'; file.accept = '.json,application/json'; file.hidden = true;
+  loadStyle.onclick = () => file.click();
+  const error = el('div','style-error'); error.setAttribute('role','status');
+  file.onchange = async () => {
+    const chosen = file.files[0]; if (!chosen) return;
+    try {
+      if (chosen.size > 65536) throw new Error('Style files must be smaller than 64 KB.');
+      const prefs = readStyle(JSON.parse(await chosen.text())); clearTimeout(prefsTimer);
+      const r = await post('prefs',{prefs:Object.assign({},S.prefs,prefs)});
+      if (!r.prefs) throw new Error(r.error || 'Could not save the style.');
+      S.prefs = r.prefs; applyPrefs(S.prefs); showSettings(); toast('Style imported');
+    } catch (e) { error.textContent = e.message; } finally { file.value = ''; }
+  };
+  row('Style files',saveStyle,loadStyle,file); w.appendChild(error);
+  w.appendChild(el('p','style-note','Save a style as a local JSON file to reuse or share. Only appearance is exported; project paths, environment variables, and code are excluded.'));
   w.appendChild(el('h2', null, 'Environment for the program'));
   const env = el('textarea', 'fld'); env.spellcheck = false; env.placeholder = 'API_URL=http://localhost:8000\nDEBUG=1\n# one KEY=VALUE per line'; env.value = S.cfg.env || '';
   env.oninput = () => { S.cfg.env = env.value; pushCfgSoon(); };
@@ -2071,7 +2620,7 @@ function showSettings() {
   w.appendChild(el('p', null, S.settingsPath || '(not available)'));
   if (S.settingsError) w.appendChild(el('p', 'nt', S.settingsError));
   const rs = el('button', null, 'Reset appearance to defaults');
-  rs.onclick = async () => { const r = await post('prefs', {reset: true}); S.prefs = r.prefs; applyPrefs(S.prefs); showSettings(); };
+  rs.onclick = async () => { clearTimeout(prefsTimer); const r = await post('prefs', {reset: true}); S.prefs = r.prefs; applyPrefs(S.prefs); showSettings(); };
   w.appendChild(rs);
   b.scrollTop = keep;
 }
@@ -2105,9 +2654,16 @@ $('#bstop').onclick = () => post('stop');
 const cmd = n => async () => { if (S.state === 'paused') { await breakSync; post(n); } };   // breakpoint edits always arrive before Continue/Step
 $('#bcont').onclick = cmd('continue'); $('#bnext').onclick = cmd('next'); $('#bstep').onclick = cmd('step'); $('#bout').onclick = cmd('out');
 document.addEventListener('keydown', e => {
-  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 's') { e.preventDefault(); saveFile(S.files.get(S.active)); }
+  if (e.defaultPrevented || e.isComposing) return;
+  const mod = e.ctrlKey || e.metaKey, target = e.target;
+  const editorContext = !$('#modal').classList.contains('on') && (target === document.body || target.closest('#editor'));
+  if (mod && !e.altKey && e.key.toLowerCase() === 's') { e.preventDefault(); e.shiftKey ? saveAll() : saveFile(S.files.get(S.active)); }
+  else if (editorContext && mod && !e.altKey && ['f','h','g'].includes(e.key.toLowerCase())) {
+    e.preventDefault(); if (e.key.toLowerCase() === 'g') goToLine(); else openFind(e.key.toLowerCase() === 'h');
+  }
+  else if (editorContext && e.key === 'F3') { e.preventDefault(); if (!FIND.open) openFind(); else nextMatch(e.shiftKey); }
   else if ((e.ctrlKey || e.metaKey) && !e.altKey && ['=', '+', '-', '_', '0'].includes(e.key)) { e.preventDefault(); zoomText(e.key === '0' ? 0 : (e.key === '-' || e.key === '_') ? -1 : 1); }
-  else if (e.key === 'Escape') { $('#mclose').click(); }
+  else if (e.key === 'Escape') { if (COMPLETE.items.length) hideCompletions(); else if ($('#modal').classList.contains('on')) $('#mclose').click(); else if (FIND.open) closeFind(); }
   else if (e.key === 'F1') { e.preventDefault(); showHelp(); }
   else if (e.key === 'F8') { e.preventDefault(); cmd('continue')(); }
   else if (e.key === 'F10') { e.preventDefault(); cmd('next')(); }

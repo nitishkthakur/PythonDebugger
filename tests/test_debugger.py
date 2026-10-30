@@ -2,9 +2,13 @@
 
     python -m unittest discover -s tests -v
 """
-import http.server
+import html.parser
 import json
 import os
+import queue
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -32,7 +36,7 @@ class Harness:
     def __init__(self, root=EX, store=None):
         self.token = "tok"
         self.sess = debugger.Session(root, "", self.token, store)
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), debugger.make_handler(self.sess))
+        self.httpd = debugger.LocalHTTPServer(("127.0.0.1", 0), debugger.make_handler(self.sess))
         self.httpd.daemon_threads = True
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -105,6 +109,71 @@ class DebuggerTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as cm:
             urllib.request.urlopen("http://127.0.0.1:%d/api/state" % self.h.port)
         self.assertEqual(cm.exception.code, 403)
+
+    def test_embedded_ui_has_offline_content_policy(self):
+        class Assets(html.parser.HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.scripts = []
+                self.external = []
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if tag == "script":
+                    self.scripts.append(attrs)
+                if tag in ("script", "img", "iframe", "link", "source", "video", "audio"):
+                    if attrs.get("src") or attrs.get("href") or attrs.get("srcset"):
+                        self.external.append((tag, attrs))
+
+        url = "http://127.0.0.1:%d/?t=tok" % self.h.port
+        with urllib.request.urlopen(url, timeout=10) as response:
+            page = response.read().decode("utf-8")
+            policy = response.headers["Content-Security-Policy"]
+            self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+        directives = dict(part.strip().split(" ", 1) for part in policy.split(";") if part.strip())
+        self.assertEqual(directives["default-src"], "'none'")
+        self.assertEqual(directives["connect-src"], "'self'")
+        self.assertEqual(directives["style-src"], "'unsafe-inline'")
+        assets = Assets()
+        assets.feed(page)
+        self.assertEqual(assets.external, [])
+        self.assertEqual(len(assets.scripts), 2)
+        for script in assets.scripts:
+            self.assertEqual(directives["script-src"], "'nonce-%s'" % script["nonce"])
+        self.assertNotIn("__BOOT__", page)
+        self.assertNotIn("__NONCE__", page)
+        styles = "\n".join(re.findall(r"<style>(.*?)</style>", page, re.S))
+        self.assertNotRegex(styles, r"(?i)@import|url\(")
+
+    def test_editor_styles_persist_and_reject_css(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "settings.json")
+            h = Harness(store=debugger.SettingsStore(path))
+            try:
+                for theme in debugger.THEME_KEYS:
+                    prefs = h.post("prefs", {"prefs": {"theme": theme, "editor_theme": "sepia",
+                                                        "editor_colors": {"background": "#123", "keyword": "#abcdef"}}})["prefs"]
+                    self.assertEqual(prefs["theme"], theme)
+                bad = h.post("prefs", {"prefs": {"theme": "remote", "editor_theme": "unknown", "editor_colors": {
+                    "background": "url(https://example.invalid/image)", "text": "red; color: white", "keyword": "#ff00aa",
+                    "font_url": "https://example.invalid/font", "comment": None}}})["prefs"]
+                self.assertEqual(bad["theme"], "contrast")
+                self.assertEqual(bad["editor_theme"], "sepia")
+                self.assertEqual(bad["editor_colors"], {"keyword": "#ff00aa"})
+                saved = debugger.SettingsStore(path).data["prefs"]
+                self.assertEqual(saved, bad)
+                defaults = h.post("prefs", {"reset": True})["prefs"]
+                self.assertEqual(defaults["editor_theme"], "match")
+                self.assertEqual(defaults["editor_colors"], {})
+            finally:
+                h.close()
+            # Older light/dark settings gain the new fields without losing choices.
+            with open(path, "w") as fh:
+                json.dump({"prefs": {"theme": "dark", "accent": "#123456"}}, fh)
+            migrated = debugger.SettingsStore(path).data["prefs"]
+            self.assertEqual((migrated["theme"], migrated["accent"]), ("dark", "#123456"))
+            self.assertEqual(migrated["editor_theme"], "match")
+            self.assertEqual(migrated["editor_colors"], {})
 
     def test_breakpoint_locals_and_continue(self):
         ln = line_of(os.path.join(EX, "demo.py"), "s = s * (1 - discount)")
@@ -695,6 +764,94 @@ class DebuggerTests(unittest.TestCase):
             if e.get("t") == t:
                 return e
         raise AssertionError("no %s event" % t)
+
+
+class StandaloneTests(unittest.TestCase):
+    def test_single_file_runs_without_site_packages_or_external_connections(self):
+        # Copy only the application, disable all site packages, and reject any
+        # non-loopback DNS/connect/bind attempts in the server process.
+        launcher = textwrap.dedent("""\
+            import runpy
+            import sys
+            def offline(event, args):
+                if event in ('socket.connect', 'socket.bind'):
+                    address = args[1]
+                    if not isinstance(address, tuple) or address[0] != '127.0.0.1':
+                        raise RuntimeError('non-loopback socket: %r' % (address,))
+                if event == 'socket.getaddrinfo' and args[0] != '127.0.0.1':
+                    raise RuntimeError('external DNS lookup')
+                if event in ('socket.gethostbyaddr', 'socket.gethostbyname'):
+                    raise RuntimeError('hostname lookup is not needed offline')
+            sys.addaudithook(offline)
+            sys.argv = sys.argv[1:]
+            runpy.run_path(sys.argv[0], run_name='__main__')
+            """)
+        with tempfile.TemporaryDirectory() as d:
+            app = os.path.join(d, "debugger.py")
+            shutil.copyfile(debugger.HERE, app)
+            with open(os.path.join(d, "target.py"), "w") as fh:
+                fh.write("value = 21\nprint('offline result:', value * 2)\n")
+            proc = subprocess.Popen([sys.executable, "-I", "-S", "-c", launcher, app, d,
+                                     "--script", "target.py", "--port", "0", "--no-browser",
+                                     "--settings", os.path.join(d, "settings.json")],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            lines = queue.Queue()
+
+            def read_output():
+                for line in proc.stdout:
+                    lines.put(line)
+
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
+            base = token = None
+
+            def request(name, body=None):
+                req = urllib.request.Request(base + "/api/" + name,
+                                             None if body is None else json.dumps(body).encode(),
+                                             {"Content-Type": "application/json", "X-Token": token})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    return json.load(response)
+
+            def wait_state(wanted):
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    state = request("state")
+                    if state["state"] == wanted:
+                        return state
+                    time.sleep(0.05)
+                self.fail("standalone debugger did not reach %s: %s" % (wanted, json.dumps(state)))
+
+            try:
+                for _ in range(4):
+                    line = lines.get(timeout=10)
+                    if line.startswith("Open: "):
+                        url = urllib.parse.urlparse(line[6:].strip())
+                        base = "%s://%s" % (url.scheme, url.netloc)
+                        token = urllib.parse.parse_qs(url.query)["t"][0]
+                        break
+                self.assertIsNotNone(base)
+                request("prefs", {"prefs": {"theme": "midnight", "editor_theme": "sepia"}})
+                request("run", {"stop_on_entry": True})
+                self.assertEqual(wait_state("paused")["stop"]["reason"], "entry")
+                request("continue", {})
+                state = wait_state("idle")
+                self.assertEqual(state["status"], "exited 0")
+                self.assertIn("offline result: 42", "".join(text for _, text in state["output"]))
+                self.assertEqual(state["prefs"]["editor_theme"], "sepia")
+            finally:
+                if base:
+                    try:
+                        request("stop", {})
+                    except OSError:
+                        pass
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                reader.join(timeout=2)
+                proc.stdout.close()
 
 
 if __name__ == "__main__":
