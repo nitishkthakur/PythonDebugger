@@ -6,8 +6,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const source = fs.readFileSync(path.join(__dirname,'..','debugger.py'),'utf8');
-const html = source.match(/PAGE_HTML = r"""([\s\S]*)"""\s*\n\s*if __name__/)[1];
+const source = fs.readFileSync(path.join(__dirname,'..','app','ui.py'),'utf8');
+const html = source.match(/PAGE_HTML = r"""([\s\S]*)"""\s*$/)[1];
 const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map(m=>m[1]);
 
 function editor(text = '', readonly = false) {

@@ -1,17 +1,55 @@
 # PythonDebugger
 
-A minimal browser-based Python debugger and light editor in one file (`debugger.py`).
-Completely offline, with all HTML, CSS, and JavaScript embedded in that file.
+A minimal browser-based Python debugger and light editor in the `app/` package.
+Completely offline, with local HTML, CSS, and JavaScript in `app/ui.py`.
 Standard library only (Python 3.8+): no pip installs, frontend build, CDNs, remote
 fonts, telemetry, or internet requests. Built on `bdb`, the engine behind `pdb`.
 The browser and debug worker communicate only over loopback on your computer;
 the UI's Content Security Policy blocks external resources and connections.
 
 ```
-python debugger.py [FOLDER] [--script path/to/script.py] [--port 8765] [--no-browser] [--settings FILE]
+python -m app [FOLDER] [--script path/to/script.py] [--port 8765] [--no-browser] [--settings FILE]
 ```
 
 It prints a URL containing a random token (localhost only); open it in Chrome.
+
+Run from the repository/distribution root. `python debugger.py` remains a
+compatibility launcher; `python app/debugger.py` also works. Copy the `app/`
+folder with the launcher when distributing the debugger; the root launcher is
+no longer a standalone application file.
+
+## Project layout
+
+| Folder | Responsibility | Status |
+| --- | --- | --- |
+| `app/` | Python debugger, tracing worker, settings, and debugger browser UI | Implemented |
+| `webapp/` | ChatGPT-like local web chat interface | Guidance scaffold |
+| `cli/` | Terminal coding-agent interface | Implemented |
+| `llm/` | Shared BaseLLM API and llama.cpp backend | Implemented |
+| `coding_tools/` | Provider-independent file, search, Git and command tools | Implemented |
+| `mcp_local/` | Local stdio MCP server, client and registry adapter | Implemented |
+| `harness/` | Versioned coding loop, planning, approvals and isolated subagents | Implemented |
+| `tests/` | Automated runtime, editor, layout, and guidance checks | Implemented |
+| `evaluations/` | Opt-in assessment scenarios and reports | Guidance scaffold |
+| `docs/` | Architecture and design documents | Implemented |
+| `memory/` | Current plan, session history, and learned facts | Implemented |
+
+Each maintained folder has an `AGENTS.md` index. Applications will share LLM
+contracts through `llm/`; the debugger remains usable without an LLM server.
+
+The first local coding agent is available with an already running llama.cpp
+server. Its default model is `unsloth/Qwen3.5-4B-GGUF:UD-Q3_K_XL` on numeric
+loopback port 9931:
+
+```sh
+python3 -m cli --root . "Read AGENTS.md and summarize the project"
+```
+
+See [coding-agent usage and customization](docs/coding-agent.md),
+[tool and MCP inventory](docs/tools-mcp.md), and
+[Deep Agents research](docs/deep-agents-research.md). Writes require
+`--allow-write`; host commands require `--allow-execute`. No LangChain or MCP
+packages are installed or needed. The ChatGPT-like web chat UI remains planned.
 
 ## Using it
 
@@ -36,7 +74,8 @@ It prints a URL containing a random token (localhost only); open it in Chrome.
 **Editing & settings.** Click the code to edit it (Ctrl+S saves, CRLF preserved, Tab/auto-indent, breakpoints
 follow your edits). The ⚙ Settings menu sets font, themes, custom colors and environment variables;
 **A− / A+** or Ctrl+`+`/`-`/`0` zoom only the text (not the layout). Everything is saved to
-`debugger_settings.json` next to `debugger.py` (git-ignored) and restored on the next start, together with your
+`debugger_settings.json` in the distribution root, next to the compatibility
+launcher (git-ignored), and restored on the next start, together with your
 last folder, script, args, breakpoints and watches. Don't put secrets in it.
 
 The editor has its own toolbar, per-tab undo/redo history, cursor/selection status,
@@ -114,7 +153,7 @@ python -m unittest discover -s tests -v
 
 End-to-end: they start the real server and a real debuggee and drive it over HTTP.
 Coverage includes style persistence/validation, embedded assets and the browser
-content policy, and a copy of the single-file app running with site packages
+content policy, and a copy of the `app/` package running with site packages
 disabled and non-loopback server connections rejected by a test audit hook.
 
 Optional editor logic checks use Node's built-in test runner (no npm packages):
@@ -123,7 +162,7 @@ Optional editor logic checks use Node's built-in test runner (no npm packages):
 node --test tests/editor.test.cjs
 ```
 
-These execute the embedded application JavaScript against a small DOM test double,
+These execute the local debugger JavaScript from `app/ui.py` against a small DOM test double,
 covering editing commands, search/replacement, history, completion, and save races.
 They do not verify browser rendering. Node is only a developer test tool; running
 the debugger still requires just Python and a browser.
@@ -139,7 +178,7 @@ browser, and their protocols. No dependency installation or frontend build is ne
 For a development session with separate settings:
 
 ```sh
-python3 debugger.py examples --script demo.py --no-browser --settings /tmp/pythondebugger-settings.json
+python3 -m app examples --script demo.py --no-browser --settings /tmp/pythondebugger-settings.json
 ```
 
 Open the printed URL, set a breakpoint, and press **Run**. The tests require

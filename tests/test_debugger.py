@@ -21,7 +21,8 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-import debugger  # noqa: E402
+from app import debugger  # noqa: E402
+from app.settings import THEME_KEYS  # noqa: E402
 
 EX = os.path.join(ROOT, "examples")
 
@@ -150,7 +151,7 @@ class DebuggerTests(unittest.TestCase):
             path = os.path.join(d, "settings.json")
             h = Harness(store=debugger.SettingsStore(path))
             try:
-                for theme in debugger.THEME_KEYS:
+                for theme in THEME_KEYS:
                     prefs = h.post("prefs", {"prefs": {"theme": theme, "editor_theme": "sepia",
                                                         "editor_colors": {"background": "#123", "keyword": "#abcdef"}}})["prefs"]
                     self.assertEqual(prefs["theme"], theme)
@@ -767,7 +768,7 @@ class DebuggerTests(unittest.TestCase):
 
 
 class StandaloneTests(unittest.TestCase):
-    def test_single_file_runs_without_site_packages_or_external_connections(self):
+    def test_app_package_runs_without_site_packages_or_external_connections(self):
         # Copy only the application, disable all site packages, and reject any
         # non-loopback DNS/connect/bind attempts in the server process.
         launcher = textwrap.dedent("""\
@@ -787,8 +788,10 @@ class StandaloneTests(unittest.TestCase):
             runpy.run_path(sys.argv[0], run_name='__main__')
             """)
         with tempfile.TemporaryDirectory() as d:
-            app = os.path.join(d, "debugger.py")
-            shutil.copyfile(debugger.HERE, app)
+            package = os.path.join(d, "app")
+            shutil.copytree(os.path.join(ROOT, "app"), package,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "debugger_settings.json*"))
+            app = os.path.join(package, "debugger.py")
             with open(os.path.join(d, "target.py"), "w") as fh:
                 fh.write("value = 21\nprint('offline result:', value * 2)\n")
             proc = subprocess.Popen([sys.executable, "-I", "-S", "-c", launcher, app, d,

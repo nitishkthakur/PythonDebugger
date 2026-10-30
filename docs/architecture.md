@@ -1,24 +1,25 @@
 # Architecture and code map
 
-The application has three cooperating parts, all implemented in `debugger.py`:
+The debugger in `app/` has three cooperating parts:
 
 ```text
-Browser (PAGE_HTML)
+Browser (app/ui.py: PAGE_HTML)
     | fetch: /api/*          ^ EventSource: /events
     v                       |
-ThreadingHTTPServer + Session
+app/debugger.py: LocalHTTPServer + Session
     | commands              ^ events
     +--- loopback socket, newline-delimited JSON ---+
                                                   |
-                                     Worker subprocess (Dbg)
+                                     app/worker.py: Dbg
                                                   |
                                       bdb traces user script
 ```
 
 The worker's stdout/stderr travel through separate subprocess pipes, and its stdin
 is supplied through a pipe. They do not share the JSON control socket.
-All debugger transports are loopback-only. Runtime resources are embedded in the
-single Python file; no dependencies or assets are downloaded. The HTTP response
+All debugger transports are loopback-only. Runtime resources are local modules,
+with the browser page embedded in `app/ui.py`; no dependencies or assets are
+downloaded. The HTTP response
 adds a Content Security Policy allowing nonce-bearing embedded scripts, inline
 styles, and same-origin API/SSE connections; external resources are blocked.
 `LocalHTTPServer` skips the standard HTTP server's hostname lookup, and the worker
@@ -34,7 +35,8 @@ connects directly to a numeric IPv4 loopback address, avoiding DNS resolution.
    update execution state, output, stack, variables, and inspection results.
 3. Run or Restart calls `Session.start`. This stops the previous process, creates
    an ephemeral loopback listener, and launches the chosen interpreter as
-   `debugger.py --worker PORT SCRIPT [ARGS...]`. The selected folder becomes its
+   `app/debugger.py --worker PORT SCRIPT [ARGS...]` using an absolute entry path.
+   The selected folder becomes its
    working directory; the script's directory becomes `sys.path[0]`.
 4. The worker authenticates with a `hello` event using `DBG_TOKEN`. The server sends
    initial breakpoints and `go`. `DBG_OPTS` carries just-my-code and stop-on-entry
@@ -53,15 +55,24 @@ connects directly to a numeric IPv4 loopback address, avoiding DNS resolution.
 
 ## Main components
 
-| Component | Responsibility |
+| Module | Components and responsibility |
 | --- | --- |
-| `describe`, `_def_loc`, `_mro_info` | Static dotted-name lookup, signatures, docs, source locations, inheritance metadata |
-| `Inspector` | Short value descriptions, object references, lazy children, paged NumPy/pandas tables |
-| `Dbg` | Breakpoint management, stepping policy, frame selection, watches, console, post-mortem |
-| `SettingsStore`, `clean_prefs`, `parse_env` | JSON persistence, preference validation, environment parsing |
-| `Session` | Configuration, subprocess and socket lifecycle, state, output buffer, event subscribers |
-| File helpers and `make_handler` | Folder browsing, source reading/saving, authenticated HTTP and SSE |
-| `PAGE_HTML` | Editor, tree, controls, terminal, stack/variables/watches, table viewer, hover, settings, Help |
+| `app/worker.py` | `describe`, `_def_loc`, `_mro_info`, `Inspector`, `Dbg`, `worker_main`: static hover, lazy inspection, tracing, console, and post-mortem |
+| `app/settings.py` | `SettingsStore`, `clean_prefs`, `parse_env`: JSON persistence, preference validation, environment parsing |
+| `app/debugger.py` | `Session`, source file helpers, `LocalHTTPServer`, `make_handler`, `serve`, `main`: lifecycle, authenticated HTTP/SSE, and startup |
+| `app/ui.py` | `PAGE_HTML`: editor, tree, controls, terminal, stack/variables/watches, table viewer, hover, settings, Help |
+| `app/__main__.py` | Package entry point for `python -m app` |
+| Root `debugger.py` | Small compatibility launcher importing `app.debugger.main` |
+
+`app.debugger` depends on settings, worker, and UI modules; those modules do not
+import the application entry point. Package imports do not start servers, threads,
+or subprocesses. Worker tracing excludes `app/worker.py`, where its execution
+frames now live. The existing `bdb.Bdb`, HTTP server, and handler inheritance is
+preserved; further abstract parents should represent actual variation.
+
+The adjacent `webapp/` and `cli/` folders reserve separate web-chat and terminal-
+chat applications. `llm/` reserves their shared inference API. These three folders
+currently contain guidance only. The LLM proposal is in [llm-design.md](llm-design.md).
 
 The editor uses a native textarea over syntax-highlighted rows. `editRange` routes
 programmatic edits through `onEdInput`, with per-file text/selection snapshots for
@@ -88,7 +99,8 @@ browser stores pending requests in `S.pending`. Execution states are `idle`,
 
 Settings persist preferences, run configuration, breakpoints, and watches through
 an atomic JSON replacement. The default is `debugger_settings.json` beside the
-script, with a home-directory fallback when that directory is not writable.
+root compatibility launcher, with a home-directory fallback when that directory
+is not writable. Moving runtime modules does not move existing user settings.
 Appearance includes independent workspace/editor palettes and optional hex-color
 overrides. Built-in palettes and the style import/export UI live in `PAGE_HTML`.
 Imports accept versioned JSON appearance data and exclude arbitrary CSS, scripts,
@@ -103,10 +115,16 @@ inspection, watches, post-mortem, stdin, environment handling, file saves,
 settings, hover metadata, and optional pandas/NumPy tables. Some asynchronous
 inspection assertions consume `Session` event queues directly. The suite does
 not exercise browser rendering, keyboard shortcuts, or SSE through a browser.
-`tests/editor.test.cjs` optionally runs the embedded JavaScript using Node's built-in
+`tests/editor.test.cjs` optionally runs the JavaScript from `app/ui.py` using Node's built-in
 test runner and a minimal DOM double. It checks editor transactions, keyboard
 handlers, history, search, replacement, suggestions, and concurrent saves. It does
 not test real browser layout, native keyboard behavior, or rendering.
+
+`tests/test_layout.py` verifies entry points (including isolated direct
+launches), safe imports, settings location/fallback, tracing exclusions, Python
+3.8 syntax, and guidance/local documentation links. The standalone regression
+copies the application package and disables site packages while an audit hook
+rejects non-loopback server connections.
 
 Only the debuggee's main thread is traced. Word completion does not perform type
 analysis. Saved edits require a restart to affect already loaded code.
